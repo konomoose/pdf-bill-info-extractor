@@ -1,0 +1,40 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local PDF statements and generated transactions
+pdf_statements/*
+!pdf_statements/.gitkeep
+
+# Currently unused generated-data folders
+extracted_tables/*
+!extracted_tables/.gitkeep
+
+input/*
+!input/.gitkeep
+
+output/*
+!output/.gitkeep
+
+# Ghostscript installer
+ghostscript-gs*.exe
+
+# Logs and temporary files
+*.log
+temp/
+tmp/
+
+# Local configuration overrides
+.env
+config/*.local.json
+
+# Editors and Windows files
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

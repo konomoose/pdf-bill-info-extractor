@@ -1,0 +1,21 @@
+{
+    "transaction_columns": [
+        "trans date",
+        "post date",
+        "description",
+        "spend categories",
+        "amount"
+    ],
+    "column_patterns": {
+        "trans date": "(trans\\.?\\s*date|transaction\\s*date|date)",
+        "post date": "(post\\.?\\s*date|posting\\s*date)",
+        "description": "(description|transaction\\s*details|details|merchant)",
+        "spend categories": "(spend\\s*categories?|category|categories|type)",
+        "amount": "(amount|amt\\.?|transaction\\s*amount|debit/credit)"
+    },
+    "extraction_settings": {
+        "table_strategy": "text",
+        "min_columns": 3,
+        "min_rows": 2
+    }
+}
