@@ -1,4 +1,4 @@
-# Python virtual environment
+# Python virtual environments
 .venv/
 venv/
 
@@ -7,25 +7,30 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# Local PDF statements and generated transactions
-pdf_statements/*
-!pdf_statements/.gitkeep
+# Institution source statements
+input/**/*
+!input/**/
+!input/**/.gitkeep
 
-# Currently unused generated-data folders
-extracted_tables/*
-!extracted_tables/.gitkeep
+# Generated extraction output
+output/**/*
+!output/**/
+!output/**/.gitkeep
 
-input/*
-!input/.gitkeep
+# Local regression-test statements
+tests/input/**/*
+!tests/input/**/
+!tests/input/**/.gitkeep
 
-output/*
-!output/.gitkeep
+# Manually verified reference CSV files
+tests/reference_output/**/*
+!tests/reference_output/**/
+!tests/reference_output/**/.gitkeep
 
-# Local test statements and reference transaction data
-tests/fixtures/statements/*
-!tests/fixtures/statements/.gitkeep
-tests/fixtures/expected/*
-!tests/fixtures/expected/.gitkeep
+# Output created by automated tests
+tests/output/**/*
+!tests/output/**/
+!tests/output/**/.gitkeep
 
 # Ghostscript installer
 ghostscript-gs*.exe
@@ -38,6 +43,7 @@ tmp/
 # Local configuration overrides
 .env
 config/*.local.json
+config/profiles/*.local.json
 
 # Editors and Windows files
 .vscode/
