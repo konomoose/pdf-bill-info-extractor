@@ -21,6 +21,12 @@ input/*
 output/*
 !output/.gitkeep
 
+# Local test statements and reference transaction data
+tests/fixtures/statements/*
+!tests/fixtures/statements/.gitkeep
+tests/fixtures/expected/*
+!tests/fixtures/expected/.gitkeep
+
 # Ghostscript installer
 ghostscript-gs*.exe
 

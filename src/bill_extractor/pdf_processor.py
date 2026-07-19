@@ -1,465 +1,500 @@
-import os
-import pandas as pd
-import pdfplumber
-import camelot
-import re
-from datetime import datetime
-import logging
+from __future__ import annotations
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import logging
+import re
+import shutil
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable
+
+import fitz  # PyMuPDF
+import pandas as pd
+
+from .profile_loader import (
+    DEFAULT_PROFILE_PATH,
+    ExtractionProfile,
+    ProfileError,
+    load_profile,
+)
+
 logger = logging.getLogger(__name__)
 
+MONTHS = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+DATE_RE = re.compile(rf"^{MONTHS}\s+\d{{1,2}}$")
+AMOUNT_RE = re.compile(r"^-?\$?\d[\d,]*\.\d{2}(?:\*+)?$")
+SUPPORTED_PARSER = "cibc_credit_card"
+
+
+class PDFProcessingError(RuntimeError):
+    """Raised when a statement cannot be processed reliably."""
+
+
+@dataclass(frozen=True)
+class ExtractionResult:
+    transactions: pd.DataFrame
+    source_pages: tuple[int, ...]
+    ghostscript_path: str | None
+
+
+@dataclass(frozen=True)
+class BatchFileResult:
+    pdf_file: Path
+    status: str
+    transaction_count: int
+    source_pages: tuple[int, ...]
+    output_csv: Path | None
+    error: str | None
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    files: tuple[BatchFileResult, ...]
+    summary_csv: Path
+    profile_id: str
+    profile_name: str
+
+    @property
+    def successful_count(self) -> int:
+        return sum(item.status == "Success" for item in self.files)
+
+    @property
+    def failed_count(self) -> int:
+        return sum(item.status == "Failed" for item in self.files)
+
+    @property
+    def transaction_count(self) -> int:
+        return sum(item.transaction_count for item in self.files)
+
+
 class VisaPDFProcessor:
-    # --- Add at top of class (constants) ---
-    TARGET_HEADERS = ["Trans date", "Post date", "Description", "Spend Categories", "Amount($)"]
-    TARGET_HEADERS_LOWER = [h.lower() for h in TARGET_HEADERS]
+    """Extract CIBC credit-card transactions using a saved profile."""
 
-    # --- Add: crop helpers to exclude headers/footers before extraction ---
-    def _crop_content_area(self, page, top_margin=80, bottom_margin=70, left_margin=10, right_margin=10):
-        """Return a pdfplumber cropped page that excludes header & footer bands."""
-        W, H = page.width, page.height
-        bbox = (left_margin, top_margin, W - right_margin, H - bottom_margin)
-        return page.within_bbox(bbox)
+    def __init__(
+        self,
+        profile: ExtractionProfile | None = None,
+        profile_path: str | Path | None = None,
+        *,
+        config_path: str | Path | None = None,
+    ) -> None:
+        if profile is not None and (profile_path is not None or config_path is not None):
+            raise PDFProcessingError(
+                "Pass either a loaded profile or a profile path, not both."
+            )
 
-    # --- Add: normalize & repair headers (join split tokens, rename variants) ---
-    def _normalize_headers(self, cols):
-        """
-        Given a list of raw column names (possibly split), join neighbors to match
-        the 5 canonical headers. Also strip spaces and fix case/variants.
-        """
-        raw = [("" if c is None else str(c)).strip() for c in cols]
+        selected_path = profile_path or config_path or DEFAULT_PROFILE_PATH
 
-        # Join obvious broken tokens (e.g., "Spen","d Categories" -> "Spend Categories")
-        joined = []
-        i = 0
-        while i < len(raw):
-            tok = raw[i]
-            if i + 1 < len(raw):
-                pair = (tok + " " + raw[i+1]).strip()
-                if pair.lower() in ["spend categories", "annual interest rate"]:
-                    joined.append(pair)
-                    i += 2
-                    continue
-            joined.append(tok)
-            i += 1
+        try:
+            self.profile = profile or load_profile(selected_path)
+        except ProfileError as exc:
+            raise PDFProcessingError(str(exc)) from exc
 
-        # Common normalizations / aliases
-        renames = {
-            "trans date": "Trans date",
-            "transaction date": "Trans date",
-            "post date": "Post date",
-            "description": "Description",
-            "spend categories": "Spend Categories",
-            "amount($)": "Amount($)",
-            "amount ($)": "Amount($)",
-            "amount": "Amount($)",  # sometimes PDF drops the ($)
-        }
+        if self.profile.parser != SUPPORTED_PARSER:
+            raise PDFProcessingError(
+                f"Profile '{self.profile.display_name}' requires unsupported parser "
+                f"'{self.profile.parser}'."
+            )
 
-        norm = []
-        for c in joined:
-            lc = c.lower()
-            norm.append(renames.get(lc, c))
+        self.required_headers = list(self.profile.required_headers)
+        self.excluded_page_phrases = list(self.profile.excluded_page_phrases)
+        self.line_tolerance = self.profile.line_tolerance
+        self.continuation_gap = self.profile.continuation_gap
 
-        # Keep only those that can map to targets or look like them
-        # (avoid extra garbage columns)
-        filtered = []
-        for c in norm:
-            cl = c.lower()
-            # crude fuzzy: accept if exact target or partial "amount", "date", etc.
-            if cl in [h.lower() for h in TARGET_HEADERS] or \
-               cl in ["amount", "amount ($)", "amount($)", "spend categories", "trans date", "post date", "description"]:
-                filtered.append(renames.get(cl, c))
-            else:
-                # ignore odd fragments like "Column_4", "An", "nual inter", etc.
-                pass
+    @staticmethod
+    def detect_ghostscript() -> str | None:
+        """Return the Ghostscript command path when it is available on PATH."""
+        return shutil.which("gswin64c") or shutil.which("gs")
 
-        # Deduplicate while preserving order
-        seen = set()
-        dedup = []
-        for c in filtered:
-            if c not in seen:
-                dedup.append(c)
-                seen.add(c)
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        return " ".join(value.split())
 
-        # If we still don't match exactly, try to coerce order to the canonical one
-        final = []
-        for h in TARGET_HEADERS:
-            # pick the first column that case-insensitively matches h
-            match = next((c for c in dedup if c.lower() == h.lower()), None)
-            if match is not None:
-                final.append(match)
-            else:
-                # allow missing for now; we'll drop later if not found
-                final.append(h)
+    def _group_words_into_lines(self, words: Iterable[tuple]) -> list[dict]:
+        sorted_words = sorted(
+            words, key=lambda word: (((word[1] + word[3]) / 2), word[0])
+        )
+        lines: list[dict] = []
 
-        return final
+        for word in sorted_words:
+            y_center = (word[1] + word[3]) / 2
 
-    def _looks_like_target_header_row(self, row_cells):
-        txt = " ".join([(str(x) if x is not None else "") for x in row_cells]).lower()
-        return all(h in txt for h in ["date", "post", "description", "amount"]) and "spend" in txt
-
-    # --- Add: clean a single raw table to our canonical 5 columns ---
-    def _clean_to_target(self, df):
-        if df is None or df.empty:
-            return None
-
-        # Drop all-empty rows/cols
-        df = df.copy()
-        df = df.dropna(how="all").dropna(axis=1, how="all")
-        df = df.applymap(lambda x: str(x).strip() if pd.notna(x) else x)
-
-        # If first row looks like headers, promote it
-        if df.shape[0] > 0 and self._looks_like_target_header_row(df.iloc[0].tolist()):
-            df.columns = self._normalize_headers(df.iloc[0].tolist())
-            df = df.iloc[1:].reset_index(drop=True)
-        else:
-            # Otherwise, try using current header row as-is but normalize
-            df.columns = self._normalize_headers(df.columns.tolist())
-
-        # Keep only canonical columns that actually exist
-        keep = [c for c in df.columns if c.lower() in TARGET_HEADERS_LOWER]
-        df = df[keep]
-
-        # Finally, reorder to canonical order and drop columns we couldn't resolve
-        cols_present = set(c.lower() for c in df.columns)
-        ordered = [h for h in TARGET_HEADERS if h.lower() in cols_present]
-        df = df.rename(columns={c: next(h for h in TARGET_HEADERS if h.lower() == c.lower()) for c in df.columns})
-        df = df[ordered].reset_index(drop=True)
-
-        # Drop any accidental duplicate header rows that re-appeared after a page break
-        if not df.empty:
-            mask_header_dupes = df.apply(lambda r: self._looks_like_target_header_row(r.tolist()), axis=1)
-            df = df[~mask_header_dupes].reset_index(drop=True)
-
-        # Remove fully-empty rows after trimming
-        df = df.replace(r"^\s*$", pd.NA, regex=True).dropna(how="all").reset_index(drop=True)
-
-        return df if not df.empty else None
-
-    # --- Add: stitch consecutive tables that share the same 5-col header ---
-    def _stitch_target_tables(self, tables_in_order):
-        """
-        Given a list of cleaned DataFrames (already normalized), stitch
-        consecutive ones that share the target header set.
-        """
-        stitched = []
-        buffer_df = None
-
-        def is_target_df(x):
-            return x is not None and list(x.columns) and \
-                   all(h in x.columns for h in TARGET_HEADERS[:3]) and \
-                   any(h in x.columns for h in ["Spend Categories"]) and \
-                   any(h in x.columns for h in ["Amount($)"])
-
-        for t in tables_in_order:
-            if not is_target_df(t):
-                # Flush buffer if present
-                if buffer_df is not None and not buffer_df.empty:
-                    stitched.append(buffer_df.reset_index(drop=True))
-                    buffer_df = None
+            if not lines or abs(y_center - lines[-1]["y_center"]) > self.line_tolerance:
+                lines.append({"y_center": y_center, "words": [word]})
                 continue
 
-            if buffer_df is None:
-                buffer_df = t.copy()
+            lines[-1]["words"].append(word)
+            lines[-1]["y_center"] = sum(
+                (item[1] + item[3]) / 2 for item in lines[-1]["words"]
+            ) / len(lines[-1]["words"])
+
+        for line in lines:
+            line["words"].sort(key=lambda word: word[0])
+
+        return lines
+
+    def _find_transaction_header(self, page: fitz.Page) -> dict | None:
+        lines = self._group_words_into_lines(page.get_text("words"))
+
+        for index, line in enumerate(lines):
+            line_text = " ".join(word[4] for word in line["words"]).lower()
+
+            if not all(
+                token in line_text for token in ("description", "spend", "categories")
+            ):
+                continue
+
+            if "amount" not in line_text:
+                continue
+
+            nearby_lines = lines[max(0, index - 1) : index + 1]
+            nearby_words = [
+                word for nearby_line in nearby_lines for word in nearby_line["words"]
+            ]
+            nearby_text = " ".join(word[4] for word in nearby_words).lower()
+
+            if not all(token in nearby_text for token in ("trans", "post", "date")):
+                continue
+
+            def first_word(token: str) -> tuple | None:
+                matches = [word for word in nearby_words if word[4].lower() == token]
+                return min(matches, key=lambda word: word[0]) if matches else None
+
+            trans = first_word("trans")
+            post = first_word("post")
+            description = first_word("description")
+            spend = first_word("spend")
+            amount = next(
+                (
+                    word
+                    for word in nearby_words
+                    if word[4].lower().replace(" ", "") in {"amount($)", "amount"}
+                ),
+                None,
+            )
+
+            if not all((trans, post, description, spend, amount)):
+                continue
+
+            x_positions = [trans[0], post[0], description[0], spend[0], amount[0]]
+            if x_positions != sorted(x_positions):
+                continue
+
+            return {
+                "trans": trans[0],
+                "post": post[0],
+                "description": description[0],
+                "spend": spend[0],
+                "amount": amount[0],
+                "bottom": max(word[3] for word in nearby_words),
+            }
+
+        return None
+
+    def _line_to_cells(self, line: dict, header: dict) -> dict[str, str]:
+        cells = {
+            "trans": [],
+            "post": [],
+            "description": [],
+            "spend": [],
+            "amount": [],
+        }
+
+        for word in line["words"]:
+            x_position = word[0]
+            text = word[4]
+
+            if text == "Ý":
+                continue
+
+            if x_position < header["post"]:
+                cells["trans"].append(text)
+            elif x_position < header["description"]:
+                cells["post"].append(text)
+            elif x_position < header["spend"]:
+                cells["description"].append(text)
+            elif x_position < header["amount"]:
+                cells["spend"].append(text)
             else:
-                # Same schema? Align columns and append.
-                shared = [c for c in TARGET_HEADERS if c in buffer_df.columns and c in t.columns]
-                if len(shared) >= 3:
-                    to_add = t[shared]
-                    buffer_df = pd.concat([buffer_df[shared], to_add], ignore_index=True)
-                else:
-                    stitched.append(buffer_df.reset_index(drop=True))
-                    buffer_df = t.copy()
+                cells["amount"].append(text)
 
-        if buffer_df is not None and not buffer_df.empty:
-            stitched.append(buffer_df.reset_index(drop=True))
+        return {
+            key: self._normalize_text(" ".join(parts)) for key, parts in cells.items()
+        }
 
-        # Final dedupe of header rows (in case any slipped through)
-        cleaned = []
-        for df in stitched:
-            mask_header_dupes = df.apply(lambda r: self._looks_like_target_header_row(r.tolist()), axis=1)
-            cleaned.append(df[~mask_header_dupes].reset_index(drop=True))
-        return cleaned
+    def _page_is_excluded(self, page_text: str) -> bool:
+        lowered = page_text.lower()
+        return all(phrase.lower() in lowered for phrase in self.excluded_page_phrases)
 
-    # --- REPLACE: extract with pdfplumber using crops & tuned settings ---
-    def extract_tables_with_pdfplumber(self, pdf_path):
-        """
-        Extract tables using pdfplumber with header/footer cropping and
-        slightly stricter table_settings to prevent header/footer noise.
-        """
-        tables = []
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page_num, page in enumerate(pdf.pages, start=1):
-                    crop = self._crop_content_area(page)  # remove header/footer bands
-                    # tuned table settings: rely on text positions; snap small gaps
-                    settings = {
-                        "vertical_strategy": "text",
-                        "horizontal_strategy": "text",
-                        "intersection_tolerance": 5,
-                        "snap_tolerance": 3,
-                        "join_tolerance": 3,
-                        "edge_min_length": 3,
-                        "min_words_vertical": 1,
-                        "min_words_horizontal": 1,
-                        "keep_blank_chars": False,
-                    }
-                    page_tables = crop.extract_tables(table_settings=settings)
-                    for ti, tbl in enumerate(page_tables, start=1):
-                        if not tbl or len(tbl) == 0:
-                            continue
-                        df = pd.DataFrame(tbl[1:], columns=tbl[0])
-                        if not df.empty:
-                            tables.append({"page": page_num, "table_num": ti, "data": df})
-        except Exception as e:
-            logger.error(f"Error extracting tables with pdfplumber from {pdf_path}: {str(e)}")
-        return tables
+    def _extract_page_transactions(self, page: fitz.Page) -> list[dict[str, str]]:
+        page_text = page.get_text("text")
 
-    # --- OPTIONAL: narrow Camelot to a content band as well (if you use Camelot) ---
-    def extract_tables_with_camelot(self, pdf_path):
-        """
-        Try Camelot after pdfplumber; favor 'stream' with edge_tol.
-        (Note: without fixed coordinates, Camelot can't crop per-page like pdfplumber,
-        but edge_tol/split_text help reduce header/footer noise.)
-        """
-        tables = []
-        try:
-            for flavor in ["stream", "lattice"]:
-                try:
-                    camelot_tables = camelot.read_pdf(
-                        pdf_path,
-                        flavor=flavor,
-                        pages="all",
-                        strip_text="\n",
-                        edge_tol=200 if flavor == "stream" else 50,
-                        split_text=True
-                    )
-                    for i, t in enumerate(camelot_tables):
-                        if not t.df.empty:
-                            tables.append({"page": t.page, "table_num": i + 1, "data": t.df})
-                    if tables:
-                        break
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.error(f"Error extracting tables with camelot from {pdf_path}: {str(e)}")
-        return tables
-
-    # --- REPLACE: process_pdf to use cleaning + stitching to one final table ---
-    def process_pdf(self, pdf_path):
-        """Process a single PDF file and return cleaned/stiched financial tables."""
-        filename = os.path.basename(pdf_path)
-        logger.info(f"Processing {filename}")
-
-        # 1) Extract (cropped) with pdfplumber first; then Camelot as backup
-        raw_tables = self.extract_tables_with_pdfplumber(pdf_path)
-        raw_tables += self.extract_tables_with_camelot(pdf_path)
-
-        if not raw_tables:
+        if self._page_is_excluded(page_text):
+            logger.info(
+                "Ignoring excluded report page %s for profile %s.",
+                page.number + 1,
+                self.profile.profile_id,
+            )
             return []
 
-        # 2) Clean each to canonical (if possible)
-        cleaned = []
-        for t in sorted(raw_tables, key=lambda x: (x["page"], x["table_num"])):
-            ct = self._clean_to_target(t["data"])
-            if ct is not None and not ct.empty:
-                cleaned.append({"page": t["page"], "table_num": t["table_num"], "data": ct})
-
-        if not cleaned:
+        header = self._find_transaction_header(page)
+        if header is None:
             return []
 
-        # 3) Stitch consecutive tables with the same 5-col schema (multi-page continuation)
-        ordered_dfs = [t["data"] for t in cleaned]
-        stitched = self._stitch_target_tables(ordered_dfs)
+        candidate_words = [
+            word for word in page.get_text("words") if word[1] >= header["bottom"] - 1
+        ]
+        lines = self._group_words_into_lines(candidate_words)
 
-        # 4) Return as if they are separate logical tables (often just 1 final table)
-        results = []
-        for idx, df in enumerate(stitched, start=1):
-            results.append({"page": idx, "table_num": idx, "data": df})
+        rows: list[dict[str, str]] = []
+        current_row: dict[str, str] | None = None
+        last_row_y: float | None = None
+        table_started = False
 
-        return results    
-    
-    def __init__(self, input_folder, output_folder):
-        self.input_folder = input_folder
-        self.output_folder = output_folder
-        os.makedirs(output_folder, exist_ok=True)
-        
-    def extract_tables_with_pdfplumber(self, pdf_path):
-        """Extract tables using pdfplumber"""
-        tables = []
+        for line in lines:
+            y_center = line["y_center"]
+            if y_center <= header["bottom"] + 1:
+                continue
+
+            cells = self._line_to_cells(line, header)
+            joined_text = self._normalize_text(" ".join(cells.values()))
+            lowered = joined_text.lower()
+
+            if not joined_text:
+                continue
+
+            if lowered.startswith("card number"):
+                continue
+
+            if lowered.startswith("total for"):
+                break
+
+            is_transaction = bool(
+                DATE_RE.fullmatch(cells["trans"])
+                and DATE_RE.fullmatch(cells["post"])
+                and AMOUNT_RE.fullmatch(cells["amount"])
+            )
+
+            if is_transaction:
+                table_started = True
+                current_row = {
+                    "Trans date": cells["trans"],
+                    "Post date": cells["post"],
+                    "Description": cells["description"],
+                    "Spend Categories": cells["spend"],
+                    "Amount($)": cells["amount"].replace("$", "").rstrip("*"),
+                }
+                rows.append(current_row)
+                last_row_y = y_center
+                continue
+
+            if not table_started or current_row is None or last_row_y is None:
+                continue
+
+            if y_center - last_row_y > self.continuation_gap:
+                break
+
+            is_continuation = (
+                not cells["trans"] and not cells["post"] and not cells["amount"]
+            )
+            if not is_continuation:
+                continue
+
+            if cells["description"]:
+                current_row["Description"] = self._normalize_text(
+                    f'{current_row["Description"]} {cells["description"]}'
+                )
+
+            if cells["spend"]:
+                current_row["Spend Categories"] = self._normalize_text(
+                    f'{current_row["Spend Categories"]} {cells["spend"]}'
+                )
+
+            last_row_y = y_center
+
+        return rows
+
+    def extract_transactions(self, pdf_path: str | Path) -> ExtractionResult:
+        source_path = Path(pdf_path)
+        if not source_path.is_file():
+            raise PDFProcessingError(f"PDF file not found: {source_path}")
+
+        ghostscript_path = self.detect_ghostscript()
+        if ghostscript_path:
+            logger.info("Ghostscript detected at %s.", ghostscript_path)
+        else:
+            logger.info(
+                "Ghostscript was not found on PATH. It is not required for this "
+                "PyMuPDF extraction path."
+            )
+
+        all_rows: list[dict[str, str]] = []
+        source_pages: list[int] = []
+        total_text_characters = 0
+
         try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page_num, page in enumerate(pdf.pages):
-                    # Try to extract tables from the page
-                    page_tables = page.extract_tables()
-                    if page_tables:
-                        for table_num, table in enumerate(page_tables):
-                            # Convert to DataFrame
-                            df = pd.DataFrame(table[1:], columns=table[0])
-                            if not df.empty:
-                                tables.append({
-                                    'page': page_num + 1,
-                                    'table_num': table_num + 1,
-                                    'data': df
-                                })
-        except Exception as e:
-            logger.error(f"Error extracting tables with pdfplumber from {pdf_path}: {str(e)}")
-        return tables
-    
-    def extract_tables_with_camelot(self, pdf_path):
-        """Extract tables using camelot"""
-        tables = []
-        try:
-            # Try different flavors for different PDF formats
-            for flavor in ['stream', 'lattice']:
-                try:
-                    camelot_tables = camelot.read_pdf(pdf_path, flavor=flavor, pages='all')
-                    for i, table in enumerate(camelot_tables):
-                        if not table.df.empty:
-                            tables.append({
-                                'page': table.page,
-                                'table_num': i + 1,
-                                'data': table.df
-                            })
-                    if tables:  # If we found tables with this flavor, break
-                        break
-                except Exception as e:
-                    continue
-        except Exception as e:
-            logger.error(f"Error extracting tables with camelot from {pdf_path}: {str(e)}")
-        return tables
-    
-    def is_financial_table(self, df):
-        """Check if the table looks like a financial transaction table"""
-        if df.empty or len(df.columns) < 3:
-            return False
-        
-        # Check for common financial table column names
-        financial_keywords = ['date', 'transaction', 'description', 'amount', 'debit', 'credit']
-        first_row = ' '.join(str(cell).lower() for cell in df.iloc[0] if pd.notna(cell))
-        
-        return any(keyword in first_row for keyword in financial_keywords)
-    
-    def clean_table(self, df):
-        """Clean extracted table data"""
-        # Remove empty rows and columns
-        df = df.dropna(how='all').dropna(axis=1, how='all')
-        
-        # Reset index
-        df = df.reset_index(drop=True)
-        
-        # Try to promote first row to header if it looks like column names
-        first_row_str = ' '.join(str(cell).lower() for cell in df.iloc[0] if pd.notna(cell))
-        if any(keyword in first_row_str for keyword in ['date', 'description', 'amount']):
-            df.columns = df.iloc[0]
-            df = df[1:].reset_index(drop=True)
-        
-        return df
-    
-    def process_pdf(self, pdf_path):
-        """Process a single PDF file"""
-        filename = os.path.basename(pdf_path)
-        logger.info(f"Processing {filename}")
-        
-        # Try both extraction methods
-        tables_plumber = self.extract_tables_with_pdfplumber(pdf_path)
-        tables_camelot = self.extract_tables_with_camelot(pdf_path)
-        
-        # Combine results
-        all_tables = tables_plumber + tables_camelot
-        
-        # Filter for financial tables and clean them
-        financial_tables = []
-        for table in all_tables:
-            if self.is_financial_table(table['data']):
-                cleaned_table = self.clean_table(table['data'])
-                if not cleaned_table.empty:
-                    financial_tables.append({
-                        'page': table['page'],
-                        'table_num': table['table_num'],
-                        'data': cleaned_table
-                    })
-        
-        return financial_tables
-    
-    def save_tables(self, pdf_filename, tables):
-        """Save extracted tables to CSV files"""
-        base_name = os.path.splitext(pdf_filename)[0]
-        output_files = []
-        
-        for i, table in enumerate(tables):
-            output_filename = f"{base_name}_page{table['page']}_table{table['table_num']}.csv"
-            output_path = os.path.join(self.output_folder, output_filename)
-            table['data'].to_csv(output_path, index=False)
-            output_files.append(output_path)
-            logger.info(f"Saved table to {output_filename}")
-        
-        return output_files
-    
-    def process_folder(self):
-        """Process all PDF files in the input folder"""
-        pdf_files = [f for f in os.listdir(self.input_folder) if f.lower().endswith('.pdf')]
-        
+            with fitz.open(source_path) as document:
+                for page_number, page in enumerate(document, start=1):
+                    total_text_characters += len(page.get_text("text").strip())
+                    page_rows = self._extract_page_transactions(page)
+                    if page_rows:
+                        all_rows.extend(page_rows)
+                        source_pages.append(page_number)
+        except (RuntimeError, ValueError) as exc:
+            raise PDFProcessingError(
+                f"Could not read PDF {source_path}: {exc}"
+            ) from exc
+
+        if not all_rows:
+            if total_text_characters == 0:
+                raise PDFProcessingError(
+                    "No readable text was found in the PDF. The statement appears "
+                    "to be image-only and requires OCR before table extraction."
+                )
+
+            raise PDFProcessingError(
+                f"The PDF contains readable text, but no transaction table matching "
+                f"profile '{self.profile.display_name}' was found."
+            )
+
+        transactions = pd.DataFrame(all_rows, columns=self.required_headers)
+        return ExtractionResult(
+            transactions=transactions,
+            source_pages=tuple(source_pages),
+            ghostscript_path=ghostscript_path,
+        )
+
+    def save_transactions(
+        self,
+        pdf_path: str | Path,
+        output_folder: str | Path | None,
+        result: ExtractionResult,
+    ) -> Path:
+        output_path = (
+            Path(output_folder)
+            if output_folder is not None
+            else self.profile.resolve_output_folder()
+        )
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        source_name = Path(pdf_path).stem
+        csv_path = output_path / f"{source_name}_transactions.csv"
+        result.transactions.to_csv(csv_path, index=False)
+        return csv_path
+
+    def process_pdf(
+        self,
+        pdf_path: str | Path,
+        output_folder: str | Path | None = None,
+    ) -> tuple[ExtractionResult, Path]:
+        result = self.extract_transactions(pdf_path)
+        csv_path = self.save_transactions(pdf_path, output_folder, result)
+        return result, csv_path
+
+    def _find_pdf_files(self, source_folder: Path) -> list[Path]:
+        iterator = (
+            source_folder.rglob(self.profile.file_pattern)
+            if self.profile.recursive
+            else source_folder.glob(self.profile.file_pattern)
+        )
+        return sorted(
+            (path for path in iterator if path.is_file()),
+            key=lambda path: str(path).casefold(),
+        )
+
+    def process_folder(
+        self,
+        input_folder: str | Path | None = None,
+        output_folder: str | Path | None = None,
+    ) -> BatchResult:
+        """Process profile-matching PDFs and continue after individual failures."""
+        source_folder = (
+            Path(input_folder)
+            if input_folder is not None
+            else self.profile.resolve_input_folder()
+        )
+        if not source_folder.is_dir():
+            raise PDFProcessingError(f"Input folder not found: {source_folder}")
+
+        pdf_files = self._find_pdf_files(source_folder)
         if not pdf_files:
-            logger.warning(f"No PDF files found in {self.input_folder}")
-            return
-        
-        logger.info(f"Found {len(pdf_files)} PDF files to process")
-        
-        all_results = {}
+            raise PDFProcessingError(
+                f"No PDF files matching '{self.profile.file_pattern}' found in: "
+                f"{source_folder}"
+            )
+
+        destination = (
+            Path(output_folder)
+            if output_folder is not None
+            else self.profile.resolve_output_folder()
+        )
+        destination.mkdir(parents=True, exist_ok=True)
+
+        file_results: list[BatchFileResult] = []
+
         for pdf_file in pdf_files:
-            pdf_path = os.path.join(self.input_folder, pdf_file)
-            tables = self.process_pdf(pdf_path)
-            
-            if tables:
-                saved_files = self.save_tables(pdf_file, tables)
-                all_results[pdf_file] = {
-                    'tables_found': len(tables),
-                    'output_files': saved_files
-                }
-            else:
-                logger.warning(f"No financial tables found in {pdf_file}")
-                all_results[pdf_file] = {
-                    'tables_found': 0,
-                    'output_files': []
-                }
-        
-        # Generate a summary report
-        self.generate_summary_report(all_results)
-        return all_results
-    
-    def generate_summary_report(self, results):
-        """Generate a summary report of the processing"""
-        report_path = os.path.join(self.output_folder, "processing_summary.txt")
-        
-        with open(report_path, 'w') as f:
-            f.write(f"Visa Statement Processing Summary\n")
-            f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("=" * 50 + "\n\n")
-            
-            total_files = len(results)
-            total_tables = sum(data['tables_found'] for data in results.values())
-            
-            f.write(f"Total PDF files processed: {total_files}\n")
-            f.write(f"Total tables extracted: {total_tables}\n\n")
-            
-            f.write("File-by-file results:\n")
-            for filename, data in results.items():
-                f.write(f"{filename}: {data['tables_found']} tables extracted\n")
-                for output_file in data['output_files']:
-                    f.write(f"  -> {os.path.basename(output_file)}\n")
+            file_destination = destination
+            if self.profile.preserve_subfolders:
+                file_destination = destination / pdf_file.parent.relative_to(source_folder)
 
-def main():
-    # Configuration - adjust these paths as needed
-    input_folder = "pdf_statements"  # Folder containing your PDF files
-    output_folder = "extracted_tables"  # Folder where CSV files will be saved
-    
-    # Create processor and run
-    processor = VisaPDFProcessor(input_folder, output_folder)
-    results = processor.process_folder()
-    
-    print(f"Processing complete. Results saved in {output_folder}")
+            try:
+                result, csv_path = self.process_pdf(pdf_file, file_destination)
+                file_results.append(
+                    BatchFileResult(
+                        pdf_file=pdf_file,
+                        status="Success",
+                        transaction_count=len(result.transactions),
+                        source_pages=result.source_pages,
+                        output_csv=csv_path,
+                        error=None,
+                    )
+                )
+            except PDFProcessingError as exc:
+                logger.warning("Could not process %s: %s", pdf_file.name, exc)
+                file_results.append(
+                    BatchFileResult(
+                        pdf_file=pdf_file,
+                        status="Failed",
+                        transaction_count=0,
+                        source_pages=(),
+                        output_csv=None,
+                        error=str(exc),
+                    )
+                )
+            except Exception as exc:
+                logger.exception("Unexpected error while processing %s", pdf_file.name)
+                file_results.append(
+                    BatchFileResult(
+                        pdf_file=pdf_file,
+                        status="Failed",
+                        transaction_count=0,
+                        source_pages=(),
+                        output_csv=None,
+                        error=f"Unexpected error: {exc}",
+                    )
+                )
 
-if __name__ == "__main__":
-    main()
+        summary_rows = [
+            {
+                "Profile ID": self.profile.profile_id,
+                "Profile Version": self.profile.profile_version,
+                "Institution": self.profile.institution,
+                "PDF File": item.pdf_file.name,
+                "Status": item.status,
+                "Transactions": item.transaction_count,
+                "Pages": ", ".join(map(str, item.source_pages)),
+                "Output CSV": str(item.output_csv) if item.output_csv else "",
+                "Error": item.error or "",
+            }
+            for item in file_results
+        ]
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary_csv = destination / f"batch_processing_summary_{timestamp}.csv"
+        pd.DataFrame(summary_rows).to_csv(summary_csv, index=False)
+
+        return BatchResult(
+            files=tuple(file_results),
+            summary_csv=summary_csv,
+            profile_id=self.profile.profile_id,
+            profile_name=self.profile.display_name,
+        )

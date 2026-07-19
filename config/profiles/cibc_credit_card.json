@@ -1,0 +1,26 @@
+{
+  "profile_id": "cibc_credit_card_v1",
+  "display_name": "CIBC Credit Card",
+  "profile_version": 1,
+  "institution": "CIBC",
+  "document_type": "credit_card_statement",
+  "parser": "cibc_credit_card",
+  "input_folder": "pdf_statements",
+  "output_folder": "pdf_statements/extracted_transactions",
+  "file_pattern": "*.pdf",
+  "recursive": false,
+  "preserve_subfolders": false,
+  "required_headers": [
+    "Trans date",
+    "Post date",
+    "Description",
+    "Spend Categories",
+    "Amount($)"
+  ],
+  "excluded_page_phrases": [
+    "CIBC CreditSmart",
+    "Spend Report"
+  ],
+  "line_tolerance": 2.5,
+  "continuation_gap": 18.0
+}
