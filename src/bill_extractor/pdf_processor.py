@@ -5,6 +5,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable
 
@@ -23,7 +24,13 @@ logger = logging.getLogger(__name__)
 MONTHS = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
 DATE_RE = re.compile(rf"^{MONTHS}\s+\d{{1,2}}$")
 AMOUNT_RE = re.compile(r"^-?\$?\d[\d,]*\.\d{2}(?:\*+)?$")
-SUPPORTED_PARSER = "cibc_credit_card"
+SIMPLII_TOTAL_OUT_RE = re.compile(
+    r"total\s+funds\s+out\s+([\d,]+\.\d{2})", re.IGNORECASE
+)
+SIMPLII_TOTAL_IN_RE = re.compile(
+    r"total\s+funds\s+in\s+([\d,]+\.\d{2})", re.IGNORECASE
+)
+SUPPORTED_PARSERS = {"cibc_credit_card", "simplii_chequing_account"}
 
 
 class PDFProcessingError(RuntimeError):
@@ -68,7 +75,7 @@ class BatchResult:
 
 
 class VisaPDFProcessor:
-    """Extract CIBC credit-card transactions using a saved profile."""
+    """Extract transactions using the parser selected by a saved profile."""
 
     def __init__(
         self,
@@ -89,7 +96,7 @@ class VisaPDFProcessor:
         except ProfileError as exc:
             raise PDFProcessingError(str(exc)) from exc
 
-        if self.profile.parser != SUPPORTED_PARSER:
+        if self.profile.parser not in SUPPORTED_PARSERS:
             raise PDFProcessingError(
                 f"Profile '{self.profile.display_name}' requires unsupported parser "
                 f"'{self.profile.parser}'."
@@ -108,6 +115,18 @@ class VisaPDFProcessor:
     @staticmethod
     def _normalize_text(value: str) -> str:
         return " ".join(value.split())
+
+    @staticmethod
+    def _word_center_x(word: tuple) -> float:
+        return (word[0] + word[2]) / 2
+
+    @staticmethod
+    def _parse_amount(value: str) -> Decimal:
+        cleaned = value.replace("$", "").replace(",", "").rstrip("*")
+        try:
+            return Decimal(cleaned)
+        except InvalidOperation as exc:
+            raise PDFProcessingError(f"Invalid monetary amount: {value}") from exc
 
     def _group_words_into_lines(self, words: Iterable[tuple]) -> list[dict]:
         sorted_words = sorted(
@@ -132,7 +151,13 @@ class VisaPDFProcessor:
 
         return lines
 
-    def _find_transaction_header(self, page: fitz.Page) -> dict | None:
+    def _page_is_excluded(self, page_text: str) -> bool:
+        lowered = page_text.lower()
+        return all(phrase.lower() in lowered for phrase in self.excluded_page_phrases)
+
+    # CIBC credit-card parser -------------------------------------------------
+
+    def _find_cibc_transaction_header(self, page: fitz.Page) -> dict | None:
         lines = self._group_words_into_lines(page.get_text("words"))
 
         for index, line in enumerate(lines):
@@ -190,7 +215,7 @@ class VisaPDFProcessor:
 
         return None
 
-    def _line_to_cells(self, line: dict, header: dict) -> dict[str, str]:
+    def _line_to_cibc_cells(self, line: dict, header: dict) -> dict[str, str]:
         cells = {
             "trans": [],
             "post": [],
@@ -221,11 +246,9 @@ class VisaPDFProcessor:
             key: self._normalize_text(" ".join(parts)) for key, parts in cells.items()
         }
 
-    def _page_is_excluded(self, page_text: str) -> bool:
-        lowered = page_text.lower()
-        return all(phrase.lower() in lowered for phrase in self.excluded_page_phrases)
-
-    def _extract_page_transactions(self, page: fitz.Page) -> list[dict[str, str]]:
+    def _extract_cibc_page_transactions(
+        self, page: fitz.Page
+    ) -> list[dict[str, str]]:
         page_text = page.get_text("text")
 
         if self._page_is_excluded(page_text):
@@ -236,7 +259,7 @@ class VisaPDFProcessor:
             )
             return []
 
-        header = self._find_transaction_header(page)
+        header = self._find_cibc_transaction_header(page)
         if header is None:
             return []
 
@@ -255,16 +278,14 @@ class VisaPDFProcessor:
             if y_center <= header["bottom"] + 1:
                 continue
 
-            cells = self._line_to_cells(line, header)
+            cells = self._line_to_cibc_cells(line, header)
             joined_text = self._normalize_text(" ".join(cells.values()))
             lowered = joined_text.lower()
 
             if not joined_text:
                 continue
-
             if lowered.startswith("card number"):
                 continue
-
             if lowered.startswith("total for"):
                 break
 
@@ -289,7 +310,6 @@ class VisaPDFProcessor:
 
             if not table_started or current_row is None or last_row_y is None:
                 continue
-
             if y_center - last_row_y > self.continuation_gap:
                 break
 
@@ -303,7 +323,6 @@ class VisaPDFProcessor:
                 current_row["Description"] = self._normalize_text(
                     f'{current_row["Description"]} {cells["description"]}'
                 )
-
             if cells["spend"]:
                 current_row["Spend Categories"] = self._normalize_text(
                     f'{current_row["Spend Categories"]} {cells["spend"]}'
@@ -312,6 +331,254 @@ class VisaPDFProcessor:
             last_row_y = y_center
 
         return rows
+
+    # Simplii chequing-account parser ----------------------------------------
+
+    def _find_simplii_transaction_header(self, page: fitz.Page) -> dict | None:
+        lines = self._group_words_into_lines(page.get_text("words"))
+
+        for index, line in enumerate(lines):
+            line_words = line["words"]
+            line_text = " ".join(word[4] for word in line_words).lower()
+
+            if "transaction" not in line_text or "balance" not in line_text:
+                continue
+            if line_text.count("funds") < 2 or "out" not in line_text or "in" not in line_text:
+                continue
+
+            nearby_lines = lines[index : index + 2]
+            nearby_words = [
+                word for nearby_line in nearby_lines for word in nearby_line["words"]
+            ]
+            nearby_text = " ".join(word[4] for word in nearby_words).lower()
+            if not all(token in nearby_text for token in ("trans.", "eff.", "date")):
+                continue
+
+            trans = next(
+                (word for word in nearby_words if word[4].lower() == "trans."),
+                None,
+            )
+            eff = next(
+                (word for word in nearby_words if word[4].lower() == "eff."),
+                None,
+            )
+            transaction = next(
+                (word for word in nearby_words if word[4].lower() == "transaction"),
+                None,
+            )
+            funds_words = sorted(
+                (word for word in nearby_words if word[4].lower() == "funds"),
+                key=lambda word: word[0],
+            )
+            balance = next(
+                (word for word in nearby_words if word[4].lower() == "balance"),
+                None,
+            )
+
+            if not all((trans, eff, transaction, balance)) or len(funds_words) < 2:
+                continue
+
+            funds_out, funds_in = funds_words[:2]
+            x_positions = [
+                trans[0],
+                eff[0],
+                transaction[0],
+                funds_out[0],
+                funds_in[0],
+                balance[0],
+            ]
+            if x_positions != sorted(x_positions):
+                continue
+
+            return {
+                "trans": trans[0],
+                "eff": eff[0],
+                "transaction": transaction[0],
+                "funds_out": funds_out[0],
+                "funds_in": funds_in[0],
+                "balance": balance[0],
+                "bottom": max(word[3] for word in nearby_words),
+            }
+
+        return None
+
+    def _line_to_simplii_cells(self, line: dict, header: dict) -> dict[str, str]:
+        cells = {
+            "trans": [],
+            "eff": [],
+            "transaction": [],
+            "funds_out": [],
+            "funds_in": [],
+            "balance": [],
+        }
+
+        for word in line["words"]:
+            text = word[4]
+            if text == "Ý":
+                continue
+
+            x_center = self._word_center_x(word)
+            if x_center < header["eff"]:
+                cells["trans"].append(text)
+            elif x_center < header["transaction"]:
+                cells["eff"].append(text)
+            elif x_center < header["funds_out"]:
+                cells["transaction"].append(text)
+            elif x_center < header["funds_in"]:
+                cells["funds_out"].append(text)
+            elif x_center < header["balance"]:
+                cells["funds_in"].append(text)
+            else:
+                cells["balance"].append(text)
+
+        return {
+            key: self._normalize_text(" ".join(parts)) for key, parts in cells.items()
+        }
+
+    def _extract_simplii_page_transactions(
+        self, page: fitz.Page
+    ) -> list[dict[str, str]]:
+        page_text = page.get_text("text")
+
+        if self._page_is_excluded(page_text):
+            logger.info(
+                "Ignoring excluded report page %s for profile %s.",
+                page.number + 1,
+                self.profile.profile_id,
+            )
+            return []
+
+        header = self._find_simplii_transaction_header(page)
+        if header is None:
+            return []
+
+        candidate_words = [
+            word for word in page.get_text("words") if word[1] >= header["bottom"] - 1
+        ]
+        lines = self._group_words_into_lines(candidate_words)
+
+        rows: list[dict[str, str]] = []
+        current_row: dict[str, str] | None = None
+        last_row_y: float | None = None
+        table_started = False
+
+        for line in lines:
+            y_center = line["y_center"]
+            if y_center <= header["bottom"] + 1:
+                continue
+
+            cells = self._line_to_simplii_cells(line, header)
+            joined_text = self._normalize_text(" ".join(cells.values()))
+            lowered = joined_text.lower()
+
+            if not joined_text:
+                continue
+            if lowered.startswith("end of transactions"):
+                break
+            if lowered.startswith("transactions continue"):
+                break
+            if lowered.startswith("page "):
+                break
+
+            funds_out_valid = bool(AMOUNT_RE.fullmatch(cells["funds_out"]))
+            funds_in_valid = bool(AMOUNT_RE.fullmatch(cells["funds_in"]))
+            balance_valid = bool(AMOUNT_RE.fullmatch(cells["balance"]))
+
+            is_transaction = bool(
+                DATE_RE.fullmatch(cells["trans"])
+                and DATE_RE.fullmatch(cells["eff"])
+                and cells["transaction"]
+                and balance_valid
+                and (funds_out_valid ^ funds_in_valid)
+            )
+
+            if is_transaction:
+                table_started = True
+                current_row = {
+                    "Trans. date": cells["trans"],
+                    "Eff. date": cells["eff"],
+                    "Transaction": cells["transaction"],
+                    "Funds out": (
+                        cells["funds_out"].replace("$", "").rstrip("*")
+                        if funds_out_valid
+                        else ""
+                    ),
+                    "Funds in": (
+                        cells["funds_in"].replace("$", "").rstrip("*")
+                        if funds_in_valid
+                        else ""
+                    ),
+                    "Balance": cells["balance"].replace("$", "").rstrip("*"),
+                }
+                rows.append(current_row)
+                last_row_y = y_center
+                continue
+
+            # BALANCE FORWARD has dates and a balance but no funds in/out.
+            if (
+                DATE_RE.fullmatch(cells["trans"])
+                and DATE_RE.fullmatch(cells["eff"])
+                and cells["transaction"].upper() == "BALANCE FORWARD"
+            ):
+                table_started = True
+                last_row_y = y_center
+                continue
+
+            if not table_started or current_row is None or last_row_y is None:
+                continue
+            if y_center - last_row_y > self.continuation_gap:
+                continue
+
+            is_continuation = not any(
+                (
+                    cells["trans"],
+                    cells["eff"],
+                    cells["funds_out"],
+                    cells["funds_in"],
+                    cells["balance"],
+                )
+            )
+            if not is_continuation or not cells["transaction"]:
+                continue
+
+            current_row["Transaction"] = self._normalize_text(
+                f'{current_row["Transaction"]} {cells["transaction"]}'
+            )
+            last_row_y = y_center
+
+        return rows
+
+    def _validate_simplii_totals(
+        self,
+        transactions: pd.DataFrame,
+        statement_total_out: Decimal | None,
+        statement_total_in: Decimal | None,
+    ) -> None:
+        if statement_total_out is None or statement_total_in is None:
+            raise PDFProcessingError(
+                "Simplii statement totals were not found. Extraction was not accepted "
+                "because completeness could not be verified."
+            )
+
+        extracted_out = sum(
+            (self._parse_amount(value) for value in transactions["Funds out"] if value),
+            Decimal("0.00"),
+        )
+        extracted_in = sum(
+            (self._parse_amount(value) for value in transactions["Funds in"] if value),
+            Decimal("0.00"),
+        )
+
+        if extracted_out != statement_total_out or extracted_in != statement_total_in:
+            raise PDFProcessingError(
+                "Simplii extraction totals do not match the statement totals. "
+                f"Extracted funds out: ${extracted_out:,.2f}; statement: "
+                f"${statement_total_out:,.2f}. Extracted funds in: "
+                f"${extracted_in:,.2f}; statement: ${statement_total_in:,.2f}. "
+                "The PDF may contain an image-only or otherwise unreadable transaction page."
+            )
+
+    # Shared processing -------------------------------------------------------
 
     def extract_transactions(self, pdf_path: str | Path) -> ExtractionResult:
         source_path = Path(pdf_path)
@@ -330,12 +597,26 @@ class VisaPDFProcessor:
         all_rows: list[dict[str, str]] = []
         source_pages: list[int] = []
         total_text_characters = 0
+        simplii_total_out: Decimal | None = None
+        simplii_total_in: Decimal | None = None
 
         try:
             with fitz.open(source_path) as document:
                 for page_number, page in enumerate(document, start=1):
-                    total_text_characters += len(page.get_text("text").strip())
-                    page_rows = self._extract_page_transactions(page)
+                    page_text = page.get_text("text")
+                    total_text_characters += len(page_text.strip())
+
+                    if self.profile.parser == "cibc_credit_card":
+                        page_rows = self._extract_cibc_page_transactions(page)
+                    else:
+                        total_out_match = SIMPLII_TOTAL_OUT_RE.search(page_text)
+                        total_in_match = SIMPLII_TOTAL_IN_RE.search(page_text)
+                        if total_out_match:
+                            simplii_total_out = self._parse_amount(total_out_match.group(1))
+                        if total_in_match:
+                            simplii_total_in = self._parse_amount(total_in_match.group(1))
+                        page_rows = self._extract_simplii_page_transactions(page)
+
                     if page_rows:
                         all_rows.extend(page_rows)
                         source_pages.append(page_number)
@@ -357,6 +638,14 @@ class VisaPDFProcessor:
             )
 
         transactions = pd.DataFrame(all_rows, columns=self.required_headers)
+
+        if self.profile.parser == "simplii_chequing_account":
+            self._validate_simplii_totals(
+                transactions,
+                simplii_total_out,
+                simplii_total_in,
+            )
+
         return ExtractionResult(
             transactions=transactions,
             source_pages=tuple(source_pages),

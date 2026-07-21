@@ -1,0 +1,38 @@
+Simplii Balance and Partial-Image Safety Update
+===============================================
+
+Exported columns
+----------------
+- Trans. date
+- Eff. date
+- Transaction
+- Funds out
+- Funds in
+- Balance
+
+Completeness protection
+-----------------------
+The parser compares extracted Funds out and Funds in totals with the totals
+printed on the statement. A partial extraction is rejected when they differ.
+
+The regression test also creates a temporary copy of the known full-text
+statement with page 1 converted to a single image. It confirms that this
+partial-image statement is rejected. No separate redacted fixture is needed
+for this test, and the temporary PDF is deleted automatically.
+
+Reference CSV migration
+-----------------------
+The previous verified reference CSV did not include Balance. Move or delete it
+before the first test run, inspect the newly generated candidate CSV, and then
+copy the verified new candidate into tests/reference_output/simplii/.
+
+Commands
+--------
+Run both profile suites:
+
+    python -m unittest tests.test_cibc_profile -v
+    python -m unittest tests.test_simplii_profile -v
+
+The Simplii candidate CSV is recreated at:
+
+    tests/output/simplii/01-jan-2025_transactions.csv

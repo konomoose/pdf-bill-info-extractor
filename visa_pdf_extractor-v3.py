@@ -7,6 +7,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+import pandas as pd
+
 from src.bill_extractor.pdf_processor import (
     BatchResult,
     PDFProcessingError,
@@ -25,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class TargetedVisaPDFExtractor:
+class PDFBillExtractorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("PDF Bill Info Extractor")
@@ -38,7 +40,9 @@ class TargetedVisaPDFExtractor:
             raise
 
         if not profiles:
-            raise PDFProcessingError("No extraction profiles were found in config/profiles.")
+            raise PDFProcessingError(
+                "No extraction profiles were found in config/profiles."
+            )
 
         self.profiles_by_name = {
             profile.display_name: profile for profile in profiles
@@ -68,7 +72,7 @@ class TargetedVisaPDFExtractor:
         ttk.Label(
             main_frame,
             textvariable=self.profile_info_var,
-            wraplength=780,
+            wraplength=820,
         ).grid(row=1, column=0, columnspan=3, pady=5)
 
         ttk.Label(main_frame, text="Profile:").grid(
@@ -80,7 +84,7 @@ class TargetedVisaPDFExtractor:
             textvariable=self.profile_var,
             values=list(self.profiles_by_name),
             state="readonly",
-            width=40,
+            width=44,
         )
         profile_combo.grid(row=2, column=1, sticky=tk.W, padx=5)
         profile_combo.bind("<<ComboboxSelected>>", self._profile_selected)
@@ -148,7 +152,7 @@ class TargetedVisaPDFExtractor:
         ttk.Label(
             main_frame,
             textvariable=self.folder_mode_info_var,
-            wraplength=780,
+            wraplength=820,
         ).grid(row=8, column=0, columnspan=3, pady=(0, 5))
 
         self.progress = ttk.Progressbar(main_frame, mode="indeterminate")
@@ -183,8 +187,7 @@ class TargetedVisaPDFExtractor:
         ).grid(row=7, column=0, sticky=(tk.W, tk.E))
 
     def _profile_selected(self, _event: object | None = None) -> None:
-        profile = self.profiles_by_name[self.profile_var.get()]
-        self._apply_profile(profile)
+        self._apply_profile(self.profiles_by_name[self.profile_var.get()])
 
     def _apply_profile(self, profile: ExtractionProfile) -> None:
         self.active_profile = profile
@@ -192,18 +195,26 @@ class TargetedVisaPDFExtractor:
 
         input_folder = profile.resolve_input_folder()
         output_folder = profile.resolve_output_folder()
+        input_folder.mkdir(parents=True, exist_ok=True)
         output_folder.mkdir(parents=True, exist_ok=True)
 
+        self.pdf_file_var.set("")
         self.pdf_folder_var.set(str(input_folder))
         self.output_folder_var.set(str(output_folder))
+
+        headers = ", ".join(profile.required_headers)
         self.profile_info_var.set(
-            f"{profile.display_name} profile v{profile.profile_version}: extracts "
-            "Trans date, Post date, Description, Spend Categories, and Amount($). "
-            "The CIBC CreditSmart Spend Report is ignored."
+            f"{profile.display_name} profile v{profile.profile_version}. "
+            f"Exported columns: {headers}."
         )
-        recursive_text = "including subfolders" if profile.recursive else "directly inside the folder"
+
+        recursive_text = (
+            "including subfolders"
+            if profile.recursive
+            else "directly inside the selected folder"
+        )
         self.folder_mode_info_var.set(
-            f"Folder mode uses {profile.file_pattern} files {recursive_text}. "
+            f"Folder mode scans {profile.file_pattern} files {recursive_text}. "
             "Each statement receives its own CSV."
         )
         self.status_var.set(f"Ready: {profile.display_name}")
@@ -214,22 +225,18 @@ class TargetedVisaPDFExtractor:
             initialdir=str(self.active_profile.resolve_input_folder()),
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
         )
-        if not file_path:
-            return
-
-        self.input_mode_var.set("file")
-        self.pdf_file_var.set(file_path)
+        if file_path:
+            self.input_mode_var.set("file")
+            self.pdf_file_var.set(file_path)
 
     def browse_pdf_folder(self) -> None:
         folder = filedialog.askdirectory(
             title="Select Folder Containing PDF Statements",
             initialdir=str(self.active_profile.resolve_input_folder()),
         )
-        if not folder:
-            return
-
-        self.input_mode_var.set("folder")
-        self.pdf_folder_var.set(folder)
+        if folder:
+            self.input_mode_var.set("folder")
+            self.pdf_folder_var.set(folder)
 
     def browse_output_folder(self) -> None:
         folder = filedialog.askdirectory(
@@ -250,61 +257,79 @@ class TargetedVisaPDFExtractor:
         Path(output_folder).mkdir(parents=True, exist_ok=True)
 
         if input_mode == "file":
-            pdf_path = self.pdf_file_var.get().strip()
-            if not pdf_path or not os.path.isfile(pdf_path):
+            input_path = self.pdf_file_var.get().strip()
+            if not input_path or not os.path.isfile(input_path):
                 messagebox.showerror("Error", "Please select a valid PDF file.")
                 return
-            input_path = pdf_path
-            opening_message = f"Processing PDF file: {Path(pdf_path).name}\n"
+            opening_message = f"Processing PDF file: {Path(input_path).name}\n"
         else:
-            folder_path = self.pdf_folder_var.get().strip()
-            if not folder_path or not os.path.isdir(folder_path):
+            input_path = self.pdf_folder_var.get().strip()
+            if not input_path or not os.path.isdir(input_path):
                 messagebox.showerror(
                     "Error", "Please select a valid folder containing PDF files."
                 )
                 return
-            input_path = folder_path
-            opening_message = f"Processing PDF folder: {folder_path}\n"
+            opening_message = f"Processing PDF folder: {input_path}\n"
+
+        processor = self.processor
+        profile = self.active_profile
 
         self.process_btn.config(state=tk.DISABLED)
         self.progress.start(10)
         self.status_var.set("Processing...")
         self.results_text.delete("1.0", tk.END)
-        self._append_result(
-            f"Profile: {self.active_profile.display_name} "
-            f"({self.active_profile.profile_id})\n"
-        )
+        self._append_result(f"Profile: {profile.display_name} ({profile.profile_id})\n")
         self._append_result(opening_message)
 
         worker = threading.Thread(
             target=self._processing_worker,
-            args=(input_mode, input_path, output_folder),
+            args=(processor, profile, input_mode, input_path, output_folder),
             daemon=True,
         )
         worker.start()
 
+    @staticmethod
+    def _numeric_total(series: pd.Series) -> float:
+        values = (
+            series.fillna("")
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("$", "", regex=False)
+        )
+        return pd.to_numeric(values, errors="coerce").fillna(0).sum()
+
+    def _transaction_total_messages(self, transactions: pd.DataFrame) -> list[str]:
+        if "Amount($)" in transactions.columns:
+            total = self._numeric_total(transactions["Amount($)"])
+            return [f"Transaction total: ${total:,.2f}"]
+
+        messages: list[str] = []
+        if "Funds out" in transactions.columns:
+            total_out = self._numeric_total(transactions["Funds out"])
+            messages.append(f"Funds out total: ${total_out:,.2f}")
+        if "Funds in" in transactions.columns:
+            total_in = self._numeric_total(transactions["Funds in"])
+            messages.append(f"Funds in total: ${total_in:,.2f}")
+        return messages
+
     def _processing_worker(
-        self, input_mode: str, input_path: str, output_folder: str
+        self,
+        processor: VisaPDFProcessor,
+        profile: ExtractionProfile,
+        input_mode: str,
+        input_path: str,
+        output_folder: str,
     ) -> None:
         try:
             if input_mode == "file":
-                result, csv_path = self.processor.process_pdf(
-                    input_path, output_folder
-                )
-                total_amount = (
-                    result.transactions["Amount($)"]
-                    .str.replace(",", "", regex=False)
-                    .astype(float)
-                    .sum()
-                )
+                result, csv_path = processor.process_pdf(input_path, output_folder)
                 messages = [
                     "\nSUCCESS",
-                    f"Profile: {self.active_profile.display_name}",
+                    f"Profile: {profile.display_name}",
                     f"PDF: {Path(input_path).name}",
                     f"Pages: {', '.join(map(str, result.source_pages))}",
                     f"Transactions: {len(result.transactions)}",
-                    f"Transaction total: ${total_amount:,.2f}",
-                    "Ignored the CIBC CreditSmart Spend Report.",
+                    *self._transaction_total_messages(result.transactions),
                     f"Saved to: {csv_path}",
                 ]
                 self.root.after(
@@ -314,9 +339,7 @@ class TargetedVisaPDFExtractor:
                     len(result.transactions),
                 )
             else:
-                batch_result = self.processor.process_folder(
-                    input_path, output_folder
-                )
+                batch_result = processor.process_folder(input_path, output_folder)
                 self.root.after(0, self._batch_processing_succeeded, batch_result)
 
         except PDFProcessingError as exc:
@@ -324,7 +347,9 @@ class TargetedVisaPDFExtractor:
             self.root.after(0, self._processing_failed, str(exc))
         except Exception as exc:
             logger.exception("Unexpected processing error")
-            self.root.after(0, self._processing_failed, f"Unexpected error: {exc}")
+            self.root.after(
+                0, self._processing_failed, f"Unexpected error: {exc}"
+            )
 
     def _single_processing_succeeded(
         self, messages: list[str], transaction_count: int
@@ -393,7 +418,7 @@ class TargetedVisaPDFExtractor:
 def main() -> None:
     root = tk.Tk()
     try:
-        TargetedVisaPDFExtractor(root)
+        PDFBillExtractorApp(root)
     except (PDFProcessingError, ProfileError) as exc:
         logger.error("Application startup failed: %s", exc)
         messagebox.showerror("Startup Error", str(exc))

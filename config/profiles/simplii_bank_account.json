@@ -1,0 +1,27 @@
+{
+  "profile_id": "simplii_chequing_account_v1",
+  "display_name": "Simplii No Fee Chequing Account",
+  "profile_version": 1,
+  "institution": "Simplii Financial",
+  "document_type": "bank_account_statement",
+  "parser": "simplii_chequing_account",
+  "input_folder": "input/simplii",
+  "output_folder": "output/simplii",
+  "file_pattern": "*.pdf",
+  "recursive": true,
+  "preserve_subfolders": true,
+  "required_headers": [
+    "Trans. date",
+    "Eff. date",
+    "Transaction",
+    "Funds out",
+    "Funds in",
+    "Balance"
+  ],
+  "excluded_page_phrases": [
+    "The following are examples of how interest is charged",
+    "Interest Rate Monthly Interest Calculation"
+  ],
+  "line_tolerance": 2.5,
+  "continuation_gap": 18.0
+}
