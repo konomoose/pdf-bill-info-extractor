@@ -1,0 +1,49 @@
+TD Visa Credit Card Profile
+===========================
+
+Exported columns
+----------------
+- Transaction date
+- Posting date
+- Activity description
+- Amount($)
+
+Normal input and output
+-----------------------
+Place TD Visa statements under:
+
+    input/td_visa/<year>/
+
+Generated statement CSV files are written under:
+
+    output/td_visa/<year>/
+
+Local regression test
+---------------------
+Keep the known full-text statement only on the local computer at:
+
+    tests/input/td_visa/full-text-test/tk-td-visa.pdf
+
+Run:
+
+    python -m unittest tests.test_td_visa_profile -v
+
+The disposable candidate CSV is written to:
+
+    tests/output/td_visa/tk-td-visa_transactions.csv
+
+After manually checking every row against the statement, copy the candidate to:
+
+    tests/reference_output/td_visa/
+
+Completeness protection
+-----------------------
+The parser reconciles the sum of extracted activity amounts with the change
+between PREVIOUS STATEMENT BALANCE and TOTAL NEW BALANCE. A partial extraction
+is rejected when the transaction page is image-only or otherwise unreadable.
+
+Privacy
+-------
+The original statement, redacted statement, candidate CSV, and reference CSV
+are ignored by Git. Commit only the parser, profile, test code, documentation,
+and empty .gitkeep placeholders.

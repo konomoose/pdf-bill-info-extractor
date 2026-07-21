@@ -1,0 +1,24 @@
+{
+  "profile_id": "td_visa_credit_card_v1",
+  "display_name": "TD Visa Credit Card",
+  "profile_version": 1,
+  "institution": "TD Bank",
+  "document_type": "credit_card_statement",
+  "parser": "td_visa_credit_card",
+  "input_folder": "input/td_visa",
+  "output_folder": "output/td_visa",
+  "file_pattern": "*.pdf",
+  "recursive": true,
+  "preserve_subfolders": true,
+  "required_headers": [
+    "Transaction date",
+    "Posting date",
+    "Activity description",
+    "Amount($)"
+  ],
+  "excluded_page_phrases": [
+    "SPECIAL OFFERS AND INFORMATION"
+  ],
+  "line_tolerance": 2.5,
+  "continuation_gap": 18.0
+}

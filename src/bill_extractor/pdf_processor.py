@@ -30,7 +30,20 @@ SIMPLII_TOTAL_OUT_RE = re.compile(
 SIMPLII_TOTAL_IN_RE = re.compile(
     r"total\s+funds\s+in\s+([\d,]+\.\d{2})", re.IGNORECASE
 )
-SUPPORTED_PARSERS = {"cibc_credit_card", "simplii_chequing_account"}
+TD_DATE_RE = re.compile(rf"^{MONTHS}\s*\d{{1,2}}$", re.IGNORECASE)
+TD_PREVIOUS_BALANCE_RE = re.compile(
+    r"previous\s+statement\s+balance\s+\$?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+TD_NEW_BALANCE_RE = re.compile(
+    r"total\s+new\s+balance\s+\$?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+SUPPORTED_PARSERS = {
+    "cibc_credit_card",
+    "simplii_chequing_account",
+    "td_visa_credit_card",
+}
 
 
 class PDFProcessingError(RuntimeError):
@@ -578,6 +591,306 @@ class VisaPDFProcessor:
                 "The PDF may contain an image-only or otherwise unreadable transaction page."
             )
 
+    # TD Visa credit-card parser ---------------------------------------------
+
+    @staticmethod
+    def _normalize_td_date(value: str) -> str:
+        compact = re.fullmatch(
+            rf"({MONTHS})\s*(\d{{1,2}})",
+            value.strip(),
+            re.IGNORECASE,
+        )
+        if compact is None:
+            return VisaPDFProcessor._normalize_text(value)
+        return f"{compact.group(1).title()} {compact.group(2)}"
+
+    @staticmethod
+    def _normalize_td_activity(value: str) -> str:
+        normalized = VisaPDFProcessor._normalize_text(value)
+        # TD's embedded text layer can encode the visible word FINANCIAL as
+        # FfNANCIAL. Keep this repair deliberately narrow.
+        return normalized.replace("FfNANCIAL", "FINANCIAL")
+
+    def _find_td_transaction_header(self, page: fitz.Page) -> dict | None:
+        lines = self._group_words_into_lines(page.get_text("words"))
+        required_tokens = {
+            "transaction",
+            "posting",
+            "activity",
+            "description",
+            "amount",
+            "date",
+        }
+
+        # TD places the transaction headings across three visual lines and
+        # interleaves a right-side rewards panel between those lines. Search
+        # windows up to five lines so the full heading is found reliably.
+        for window_size in range(1, 6):
+            for index in range(0, len(lines) - window_size + 1):
+                nearby_lines = lines[index : index + window_size]
+                nearby_words = [
+                    word
+                    for nearby_line in nearby_lines
+                    for word in nearby_line["words"]
+                ]
+                nearby_text = " ".join(word[4] for word in nearby_words).lower()
+                tokens = set(re.findall(r"[a-z]+", nearby_text))
+
+                if not required_tokens.issubset(tokens):
+                    continue
+
+                transaction = next(
+                    (word for word in nearby_words if word[4].lower() == "transaction"),
+                    None,
+                )
+                posting = next(
+                    (word for word in nearby_words if word[4].lower() == "posting"),
+                    None,
+                )
+                activity = next(
+                    (word for word in nearby_words if word[4].lower() == "activity"),
+                    None,
+                )
+                amount = next(
+                    (
+                        word
+                        for word in nearby_words
+                        if word[4].lower().replace(" ", "")
+                        in {"amount($)", "amount"}
+                    ),
+                    None,
+                )
+
+                if not all((transaction, posting, activity, amount)):
+                    continue
+
+                x_positions = [
+                    transaction[0],
+                    posting[0],
+                    activity[0],
+                    amount[0],
+                ]
+                if x_positions != sorted(x_positions):
+                    continue
+
+                # The transaction table ends just after the amount heading.
+                # Everything farther right belongs to TD's rewards/payment
+                # panels and must not be mixed into transaction cells.
+                table_right = amount[2] + 4.0
+                table_header_words = [
+                    word for word in nearby_words if self._word_center_x(word) < table_right
+                ]
+
+                return {
+                    "transaction_date": transaction[0],
+                    "posting_date": posting[0],
+                    "activity": activity[0],
+                    "amount": amount[0],
+                    "right": table_right,
+                    "bottom": max(word[3] for word in table_header_words),
+                }
+
+        return None
+
+    def _line_to_td_cells(self, line: dict, header: dict) -> dict[str, str]:
+        cells = {
+            "transaction_date": [],
+            "posting_date": [],
+            "activity": [],
+            "amount": [],
+        }
+
+        for word in line["words"]:
+            text = word[4]
+            if text == "Ý":
+                continue
+
+            x_center = self._word_center_x(word)
+            if x_center >= header["right"]:
+                continue
+
+            if x_center < header["posting_date"]:
+                cells["transaction_date"].append(text)
+            elif x_center < header["activity"]:
+                cells["posting_date"].append(text)
+            elif x_center < header["amount"]:
+                cells["activity"].append(text)
+            else:
+                cells["amount"].append(text)
+
+        return {
+            key: self._normalize_text(" ".join(parts)) for key, parts in cells.items()
+        }
+
+    def _extract_td_page_transactions(
+        self, page: fitz.Page
+    ) -> list[dict[str, str]]:
+        page_text = page.get_text("text")
+
+        if self._page_is_excluded(page_text):
+            logger.info(
+                "Ignoring excluded report page %s for profile %s.",
+                page.number + 1,
+                self.profile.profile_id,
+            )
+            return []
+
+        header = self._find_td_transaction_header(page)
+        if header is None:
+            return []
+
+        candidate_words = [
+            word
+            for word in page.get_text("words")
+            if word[1] >= header["bottom"] - 1
+            and self._word_center_x(word) < header["right"]
+        ]
+        lines = self._group_words_into_lines(candidate_words)
+
+        rows: list[dict[str, str]] = []
+        current_row: dict[str, str] | None = None
+        last_row_y: float | None = None
+        table_started = False
+
+        for line in lines:
+            y_center = line["y_center"]
+            if y_center <= header["bottom"] + 1:
+                continue
+
+            cells = self._line_to_td_cells(line, header)
+            joined_text = self._normalize_text(" ".join(cells.values()))
+            lowered = joined_text.lower()
+
+            if not joined_text:
+                continue
+            if "total new balance" in lowered:
+                break
+            if lowered.startswith("td message centre"):
+                break
+            if "previous statement balance" in lowered:
+                continue
+
+            transaction_date = self._normalize_td_date(cells["transaction_date"])
+            posting_date = self._normalize_td_date(cells["posting_date"])
+            amount = cells["amount"]
+
+            is_transaction = bool(
+                TD_DATE_RE.fullmatch(cells["transaction_date"])
+                and TD_DATE_RE.fullmatch(cells["posting_date"])
+                and cells["activity"]
+                and AMOUNT_RE.fullmatch(amount)
+            )
+
+            if is_transaction:
+                table_started = True
+                current_row = {
+                    "Transaction date": transaction_date,
+                    "Posting date": posting_date,
+                    "Activity description": self._normalize_td_activity(
+                        cells["activity"]
+                    ),
+                    "Amount($)": amount.replace("$", "").rstrip("*"),
+                }
+                rows.append(current_row)
+                last_row_y = y_center
+                continue
+
+            if not table_started or current_row is None or last_row_y is None:
+                continue
+            if y_center - last_row_y > self.continuation_gap:
+                continue
+
+            is_continuation = not any(
+                (
+                    cells["transaction_date"],
+                    cells["posting_date"],
+                    cells["amount"],
+                )
+            )
+            if not is_continuation or not cells["activity"]:
+                continue
+
+            current_row["Activity description"] = self._normalize_td_activity(
+                f'{current_row["Activity description"]} {cells["activity"]}'
+            )
+            last_row_y = y_center
+
+        return rows
+
+
+    def _extract_td_statement_balances(
+        self,
+        page: fitz.Page,
+    ) -> tuple[Decimal | None, Decimal | None]:
+        # Read TD balance rows from their visual positions on the left panel.
+        previous_balance: Decimal | None = None
+        new_balance: Decimal | None = None
+
+        # TD interleaves right-side rewards/payment-panel text into page.get_text().
+        # Restrict this check to the left statement panel where the balance rows live.
+        left_panel_words = [
+            word
+            for word in page.get_text("words")
+            if self._word_center_x(word) < 350
+        ]
+
+        for line in self._group_words_into_lines(left_panel_words):
+            line_text = self._normalize_text(
+                " ".join(str(word[4]) for word in line["words"])
+            )
+            lowered = line_text.lower()
+
+            if (
+                "previous statement balance" not in lowered
+                and "total new balance" not in lowered
+            ):
+                continue
+
+            amount_tokens = [
+                str(word[4])
+                for word in line["words"]
+                if AMOUNT_RE.fullmatch(str(word[4]))
+            ]
+            if not amount_tokens:
+                continue
+
+            amount = self._parse_amount(amount_tokens[-1])
+
+            if "previous statement balance" in lowered:
+                previous_balance = amount
+            elif "total new balance" in lowered:
+                new_balance = amount
+
+        return previous_balance, new_balance
+
+    def _validate_td_balance(
+        self,
+        transactions: pd.DataFrame,
+        previous_balance: Decimal | None,
+        new_balance: Decimal | None,
+    ) -> None:
+        if previous_balance is None or new_balance is None:
+            raise PDFProcessingError(
+                "TD Visa statement balances were not found. Extraction was not "
+                "accepted because completeness could not be verified."
+            )
+
+        extracted_total = sum(
+            (self._parse_amount(value) for value in transactions["Amount($)"] if value),
+            Decimal("0.00"),
+        )
+        expected_total = new_balance - previous_balance
+
+        if extracted_total != expected_total:
+            raise PDFProcessingError(
+                "TD Visa extraction does not reconcile with the statement balance. "
+                f"Extracted transaction total: ${extracted_total:,.2f}; expected "
+                f"change: ${expected_total:,.2f}. Previous balance: "
+                f"${previous_balance:,.2f}; new balance: ${new_balance:,.2f}. "
+                "The PDF may contain an image-only or otherwise unreadable "
+                "transaction page."
+            )
+
     # Shared processing -------------------------------------------------------
 
     def extract_transactions(self, pdf_path: str | Path) -> ExtractionResult:
@@ -599,6 +912,8 @@ class VisaPDFProcessor:
         total_text_characters = 0
         simplii_total_out: Decimal | None = None
         simplii_total_in: Decimal | None = None
+        td_previous_balance: Decimal | None = None
+        td_new_balance: Decimal | None = None
 
         try:
             with fitz.open(source_path) as document:
@@ -608,7 +923,7 @@ class VisaPDFProcessor:
 
                     if self.profile.parser == "cibc_credit_card":
                         page_rows = self._extract_cibc_page_transactions(page)
-                    else:
+                    elif self.profile.parser == "simplii_chequing_account":
                         total_out_match = SIMPLII_TOTAL_OUT_RE.search(page_text)
                         total_in_match = SIMPLII_TOTAL_IN_RE.search(page_text)
                         if total_out_match:
@@ -616,6 +931,16 @@ class VisaPDFProcessor:
                         if total_in_match:
                             simplii_total_in = self._parse_amount(total_in_match.group(1))
                         page_rows = self._extract_simplii_page_transactions(page)
+                    else:
+                        (
+                            page_previous_balance,
+                            page_new_balance,
+                        ) = self._extract_td_statement_balances(page)
+                        if page_previous_balance is not None:
+                            td_previous_balance = page_previous_balance
+                        if page_new_balance is not None:
+                            td_new_balance = page_new_balance
+                        page_rows = self._extract_td_page_transactions(page)
 
                     if page_rows:
                         all_rows.extend(page_rows)
@@ -632,6 +957,12 @@ class VisaPDFProcessor:
                     "to be image-only and requires OCR before table extraction."
                 )
 
+            if self.profile.parser == "td_visa_credit_card":
+                raise PDFProcessingError(
+                    "No readable TD Visa transaction table was found. The transaction "
+                    "page may be image-only or otherwise unreadable."
+                )
+
             raise PDFProcessingError(
                 f"The PDF contains readable text, but no transaction table matching "
                 f"profile '{self.profile.display_name}' was found."
@@ -644,6 +975,12 @@ class VisaPDFProcessor:
                 transactions,
                 simplii_total_out,
                 simplii_total_in,
+            )
+        elif self.profile.parser == "td_visa_credit_card":
+            self._validate_td_balance(
+                transactions,
+                td_previous_balance,
+                td_new_balance,
             )
 
         return ExtractionResult(
