@@ -24,6 +24,27 @@ logger = logging.getLogger(__name__)
 MONTHS = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
 DATE_RE = re.compile(rf"^{MONTHS}\s+\d{{1,2}}$")
 AMOUNT_RE = re.compile(r"^-?\$?\d[\d,]*\.\d{2}(?:\*+)?$")
+
+RBC_ROW_RE = re.compile(
+    rf"^({MONTHS})\s+(\d{{1,2}})\s+"
+    rf"({MONTHS})\s+(\d{{1,2}})\s+"
+    r"(.+?)\s+(-?\$?\d[\d,]*\.\d{2}(?:\*+)?)$",
+    re.IGNORECASE,
+)
+RBC_REFERENCE_RE = re.compile(r"^\d{23}$")
+RBC_PREVIOUS_BALANCE_RE = re.compile(
+    r"Previous\s+Account\s+Balance\s+"
+    r"(-?\$?\d[\d,]*\.\d{2})",
+    re.IGNORECASE,
+)
+RBC_TOTAL_BALANCE_RE = re.compile(
+    r"Total\s+Account\s+Balance\s+"
+    r"(-?\$?\d[\d,]*\.\d{2})",
+    re.IGNORECASE,
+)
+SIMPLII_BALANCE_RE = re.compile(
+    r"^(?:-\$?\d[\d,]*\.\d{2}|\$?\d[\d,]*\.\d{2}-?)(?:\*+)?$"
+)
 SIMPLII_TOTAL_OUT_RE = re.compile(
     r"total\s+funds\s+out\s+([\d,]+\.\d{2})", re.IGNORECASE
 )
@@ -43,6 +64,7 @@ SUPPORTED_PARSERS = {
     "cibc_credit_card",
     "simplii_chequing_account",
     "td_visa_credit_card",
+    "rbc_visa_credit_card",
 }
 
 
@@ -448,6 +470,15 @@ class VisaPDFProcessor:
             key: self._normalize_text(" ".join(parts)) for key, parts in cells.items()
         }
 
+
+    @staticmethod
+    def _normalize_simplii_balance(value: str) -> str:
+        """Convert Simplii trailing-minus balances to standard signed numbers."""
+        cleaned = value.replace("$", "").rstrip("*")
+        if cleaned.endswith("-"):
+            return f"-{cleaned[:-1]}"
+        return cleaned
+
     def _extract_simplii_page_transactions(
         self, page: fitz.Page
     ) -> list[dict[str, str]]:
@@ -495,7 +526,7 @@ class VisaPDFProcessor:
 
             funds_out_valid = bool(AMOUNT_RE.fullmatch(cells["funds_out"]))
             funds_in_valid = bool(AMOUNT_RE.fullmatch(cells["funds_in"]))
-            balance_valid = bool(AMOUNT_RE.fullmatch(cells["balance"]))
+            balance_valid = bool(SIMPLII_BALANCE_RE.fullmatch(cells["balance"]))
 
             is_transaction = bool(
                 DATE_RE.fullmatch(cells["trans"])
@@ -521,7 +552,7 @@ class VisaPDFProcessor:
                         if funds_in_valid
                         else ""
                     ),
-                    "Balance": cells["balance"].replace("$", "").rstrip("*"),
+                    "Balance": self._normalize_simplii_balance(cells["balance"]),
                 }
                 rows.append(current_row)
                 last_row_y = y_center
@@ -891,6 +922,251 @@ class VisaPDFProcessor:
                 "transaction page."
             )
 
+
+    # RBC Visa credit-card parser --------------------------------------------
+
+    @staticmethod
+    def _normalize_rbc_date(month: str, day: str) -> str:
+        """Normalize RBC dates such as DEC 14 and JAN 04."""
+        return f"{month.title()} {int(day)}"
+
+    def _find_rbc_transaction_header(self, page: fitz.Page) -> dict | None:
+        """Locate RBC's four-column transaction heading."""
+        lines = self._group_words_into_lines(page.get_text("words"))
+        required_tokens = {
+            "transaction",
+            "posting",
+            "activity",
+            "description",
+            "amount",
+            "date",
+        }
+
+        # RBC spreads the heading over several closely spaced visual lines.
+        for window_size in range(1, 6):
+            for index in range(0, len(lines) - window_size + 1):
+                nearby_lines = lines[index : index + window_size]
+                nearby_words = [
+                    word
+                    for nearby_line in nearby_lines
+                    for word in nearby_line["words"]
+                ]
+                nearby_text = " ".join(
+                    str(word[4]) for word in nearby_words
+                ).lower()
+                tokens = set(re.findall(r"[a-z]+", nearby_text))
+
+                if not required_tokens.issubset(tokens):
+                    continue
+
+                transaction = next(
+                    (
+                        word
+                        for word in nearby_words
+                        if str(word[4]).lower() == "transaction"
+                    ),
+                    None,
+                )
+                posting = next(
+                    (
+                        word
+                        for word in nearby_words
+                        if str(word[4]).lower() == "posting"
+                    ),
+                    None,
+                )
+                amount = next(
+                    (
+                        word
+                        for word in nearby_words
+                        if str(word[4]).lower().replace(" ", "")
+                        in {"amount", "amount($)"}
+                    ),
+                    None,
+                )
+
+                if not all((transaction, posting, amount)):
+                    continue
+
+                if not (
+                    transaction[0] < posting[0] < amount[0]
+                ):
+                    continue
+
+                amount_words = [
+                    word
+                    for word in nearby_words
+                    if str(word[4]).lower().replace(" ", "")
+                    in {"amount", "amount($)", "($)"}
+                ]
+
+                table_right = max(word[2] for word in amount_words) + 4.0
+
+                table_header_words = [
+                    word
+                    for word in nearby_words
+                    if self._word_center_x(word) < table_right
+                ]
+
+                return {
+                    "right": table_right,
+                    "bottom": max(word[3] for word in table_header_words),
+                }
+
+        return None
+
+    def _extract_rbc_page_transactions(
+        self,
+        page: fitz.Page,
+    ) -> list[dict[str, str]]:
+        page_text = page.get_text("text")
+
+        if self._page_is_excluded(page_text):
+            logger.info(
+                "Ignoring excluded report page %s for profile %s.",
+                page.number + 1,
+                self.profile.profile_id,
+            )
+            return []
+
+        header = self._find_rbc_transaction_header(page)
+        if header is None:
+            return []
+
+        # RBC places account/rewards information to the right of the
+        # transaction table. Restrict extraction to the table width.
+        candidate_words = [
+            word
+            for word in page.get_text("words")
+            if word[1] >= header["bottom"] - 1
+            and self._word_center_x(word) < header["right"]
+        ]
+
+        lines = self._group_words_into_lines(candidate_words)
+
+        rows: list[dict[str, str]] = []
+        current_row: dict[str, str] | None = None
+        last_row_y: float | None = None
+        table_started = False
+
+        for line in lines:
+            y_center = line["y_center"]
+
+            if y_center <= header["bottom"] + 1:
+                continue
+
+            line_text = self._normalize_text(
+                " ".join(str(word[4]) for word in line["words"])
+            )
+
+            if not line_text:
+                continue
+
+            if "subtotal of monthly activity" in line_text.lower():
+                break
+
+            row_match = RBC_ROW_RE.fullmatch(line_text)
+
+            if row_match is not None:
+                table_started = True
+
+                transaction_month = row_match.group(1)
+                transaction_day = row_match.group(2)
+                posting_month = row_match.group(3)
+                posting_day = row_match.group(4)
+                activity = self._normalize_text(row_match.group(5))
+                amount = row_match.group(6)
+
+                current_row = {
+                    "Transaction date": self._normalize_rbc_date(
+                        transaction_month,
+                        transaction_day,
+                    ),
+                    "Posting date": self._normalize_rbc_date(
+                        posting_month,
+                        posting_day,
+                    ),
+                    "Activity description": activity,
+                    "Amount($)": amount.replace("$", "").rstrip("*"),
+                }
+
+                rows.append(current_row)
+                last_row_y = y_center
+                continue
+
+            if not table_started or current_row is None or last_row_y is None:
+                continue
+
+            # RBC prints a 23-digit transaction/reference number below most
+            # activity rows. It is metadata, not part of the description.
+            if RBC_REFERENCE_RE.fullmatch(line_text):
+                continue
+
+            if y_center - last_row_y > self.continuation_gap:
+                continue
+
+            # Preserve a genuine wrapped description should one occur.
+            if AMOUNT_RE.fullmatch(line_text):
+                continue
+
+            current_row["Activity description"] = self._normalize_text(
+                f'{current_row["Activity description"]} {line_text}'
+            )
+            last_row_y = y_center
+
+        return rows
+
+    def _extract_rbc_statement_balances(
+        self,
+        page_text: str,
+    ) -> tuple[Decimal | None, Decimal | None]:
+        previous_balance: Decimal | None = None
+        total_balance: Decimal | None = None
+
+        previous_match = RBC_PREVIOUS_BALANCE_RE.search(page_text)
+        total_match = RBC_TOTAL_BALANCE_RE.search(page_text)
+
+        if previous_match is not None:
+            previous_balance = self._parse_amount(previous_match.group(1))
+
+        if total_match is not None:
+            total_balance = self._parse_amount(total_match.group(1))
+
+        return previous_balance, total_balance
+
+    def _validate_rbc_balance(
+        self,
+        transactions: pd.DataFrame,
+        previous_balance: Decimal | None,
+        total_balance: Decimal | None,
+    ) -> None:
+        if previous_balance is None or total_balance is None:
+            raise PDFProcessingError(
+                "RBC Visa statement balances were not found. Extraction was not "
+                "accepted because completeness could not be verified."
+            )
+
+        extracted_total = sum(
+            (
+                self._parse_amount(value)
+                for value in transactions["Amount($)"]
+                if value
+            ),
+            Decimal("0.00"),
+        )
+
+        expected_total = total_balance - previous_balance
+
+        if extracted_total != expected_total:
+            raise PDFProcessingError(
+                "RBC Visa extraction does not reconcile with the statement balance. "
+                f"Extracted transaction total: ${extracted_total:,.2f}; expected "
+                f"change: ${expected_total:,.2f}. Previous balance: "
+                f"${previous_balance:,.2f}; total balance: ${total_balance:,.2f}. "
+                "The PDF may contain an image-only or otherwise unreadable "
+                "transaction page."
+            )
+
     # Shared processing -------------------------------------------------------
 
     def extract_transactions(self, pdf_path: str | Path) -> ExtractionResult:
@@ -914,6 +1190,8 @@ class VisaPDFProcessor:
         simplii_total_in: Decimal | None = None
         td_previous_balance: Decimal | None = None
         td_new_balance: Decimal | None = None
+        rbc_previous_balance: Decimal | None = None
+        rbc_total_balance: Decimal | None = None
 
         try:
             with fitz.open(source_path) as document:
@@ -931,7 +1209,7 @@ class VisaPDFProcessor:
                         if total_in_match:
                             simplii_total_in = self._parse_amount(total_in_match.group(1))
                         page_rows = self._extract_simplii_page_transactions(page)
-                    else:
+                    elif self.profile.parser == "td_visa_credit_card":
                         (
                             page_previous_balance,
                             page_new_balance,
@@ -941,6 +1219,20 @@ class VisaPDFProcessor:
                         if page_new_balance is not None:
                             td_new_balance = page_new_balance
                         page_rows = self._extract_td_page_transactions(page)
+                    elif self.profile.parser == "rbc_visa_credit_card":
+                        (
+                            page_previous_balance,
+                            page_total_balance,
+                        ) = self._extract_rbc_statement_balances(page_text)
+                        if page_previous_balance is not None:
+                            rbc_previous_balance = page_previous_balance
+                        if page_total_balance is not None:
+                            rbc_total_balance = page_total_balance
+                        page_rows = self._extract_rbc_page_transactions(page)
+                    else:
+                        raise PDFProcessingError(
+                            f"Unsupported parser '{self.profile.parser}'."
+                        )
 
                     if page_rows:
                         all_rows.extend(page_rows)
@@ -963,6 +1255,12 @@ class VisaPDFProcessor:
                     "page may be image-only or otherwise unreadable."
                 )
 
+            if self.profile.parser == "rbc_visa_credit_card":
+                raise PDFProcessingError(
+                    "No readable RBC Visa transaction table was found. The transaction "
+                    "page may be image-only or otherwise unreadable."
+                )
+
             raise PDFProcessingError(
                 f"The PDF contains readable text, but no transaction table matching "
                 f"profile '{self.profile.display_name}' was found."
@@ -981,6 +1279,12 @@ class VisaPDFProcessor:
                 transactions,
                 td_previous_balance,
                 td_new_balance,
+            )
+        elif self.profile.parser == "rbc_visa_credit_card":
+            self._validate_rbc_balance(
+                transactions,
+                rbc_previous_balance,
+                rbc_total_balance,
             )
 
         return ExtractionResult(

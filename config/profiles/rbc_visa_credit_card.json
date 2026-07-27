@@ -1,0 +1,24 @@
+{
+  "profile_id": "rbc_visa_credit_card_v1",
+  "display_name": "RBC Visa Credit Card",
+  "profile_version": 1,
+  "institution": "RBC Royal Bank",
+  "document_type": "credit_card_statement",
+  "parser": "rbc_visa_credit_card",
+  "input_folder": "input/rbc",
+  "output_folder": "output/rbc",
+  "file_pattern": "*.pdf",
+  "recursive": true,
+  "preserve_subfolders": true,
+  "required_headers": [
+    "Transaction date",
+    "Posting date",
+    "Activity description",
+    "Amount($)"
+  ],
+  "excluded_page_phrases": [
+    "INTEREST RATE CHART"
+  ],
+  "line_tolerance": 2.5,
+  "continuation_gap": 18.0
+}
