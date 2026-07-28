@@ -1,10 +1,9 @@
-# Python virtual environments
-.venv/
-venv/
 
-# Python-generated files
+# Python cache files
 __pycache__/
 *.py[cod]
+/secured_input/**
+!/secured_input/.gitkeep
 .pytest_cache/
 
 # Institution source statements

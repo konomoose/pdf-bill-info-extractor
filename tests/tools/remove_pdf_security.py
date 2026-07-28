@@ -11,6 +11,10 @@ from pathlib import Path
 import fitz  # PyMuPDF
 
 
+DEFAULT_SOURCE_ROOT = Path("secured_input")
+DEFAULT_OUTPUT_ROOT = Path("input")
+
+
 @dataclass(frozen=True)
 class PageTextState:
     page_number: int
@@ -18,6 +22,14 @@ class PageTextState:
     positioned_words: int
     images: int
     normalized_text_hash: str
+
+
+@dataclass(frozen=True)
+class ProcessResult:
+    source: Path
+    destination: Path
+    status: str
+    message: str
 
 
 def normalized_text_hash(text: str) -> str:
@@ -31,6 +43,7 @@ def inspect_document(document: fitz.Document) -> list[PageTextState]:
     for page_number, page in enumerate(document, start=1):
         text = page.get_text("text")
         words = page.get_text("words")
+
         states.append(
             PageTextState(
                 page_number=page_number,
@@ -44,122 +57,215 @@ def inspect_document(document: fitz.Document) -> list[PageTextState]:
     return states
 
 
-def print_page_summary(label: str, states: list[PageTextState]) -> None:
-    print(label)
-    for state in states:
-        print(
-            f"  Page {state.page_number}: "
-            f"{state.text_characters} text characters, "
-            f"{state.positioned_words} positioned words, "
-            f"{state.images} images"
-        )
-
-
 def verify_text_preserved(
     source_states: list[PageTextState],
     output_states: list[PageTextState],
 ) -> None:
     if len(source_states) != len(output_states):
         raise RuntimeError(
-            f"Page count changed from {len(source_states)} to {len(output_states)}."
+            f"Page count changed from {len(source_states)} "
+            f"to {len(output_states)}."
         )
 
-    source_total_words = sum(state.positioned_words for state in source_states)
-    output_total_words = sum(state.positioned_words for state in output_states)
+    source_total_words = sum(
+        state.positioned_words for state in source_states
+    )
+    output_total_words = sum(
+        state.positioned_words for state in output_states
+    )
 
     if source_total_words == 0:
         raise RuntimeError(
-            "The source PDF is image-only. Removing PDF security cannot create a "
-            "text layer; OCR would be required."
+            "Source PDF is image-only. Security removal cannot create "
+            "a text layer; OCR would be required."
         )
 
     if output_total_words == 0:
         raise RuntimeError(
-            "The saved PDF became image-only or lost its readable text layer."
+            "Saved PDF lost its readable text layer."
         )
 
-    for source, output in zip(source_states, output_states, strict=True):
-        if source.positioned_words == 0 and source.text_characters == 0:
-            # A legitimate promotional or scanned page may already be image-only.
+    for source, output in zip(
+        source_states,
+        output_states,
+        strict=True,
+    ):
+        if (
+            source.positioned_words == 0
+            and source.text_characters == 0
+        ):
+            # A page that was already image-only is allowed to remain so.
             continue
 
-        if output.positioned_words == 0 or output.text_characters == 0:
+        if (
+            output.positioned_words == 0
+            or output.text_characters == 0
+        ):
             raise RuntimeError(
-                f"Page {source.page_number} had readable text before saving but "
-                "has no readable text afterward."
+                f"Page {source.page_number} had readable text before "
+                "saving but none afterward."
             )
 
         if source.positioned_words != output.positioned_words:
             raise RuntimeError(
-                f"Page {source.page_number} positioned-word count changed from "
-                f"{source.positioned_words} to {output.positioned_words}."
+                f"Page {source.page_number} positioned-word count "
+                f"changed from {source.positioned_words} "
+                f"to {output.positioned_words}."
             )
 
-        if source.normalized_text_hash != output.normalized_text_hash:
+        if (
+            source.normalized_text_hash
+            != output.normalized_text_hash
+        ):
             raise RuntimeError(
-                f"Page {source.page_number} extracted text changed during saving."
+                f"Page {source.page_number} extracted text changed "
+                "during security removal."
             )
 
 
-def authenticate_document(document: fitz.Document, password: str | None) -> int:
-    # Calling authenticate("") also handles owner-password-only PDFs that open
-    # normally but have permission restrictions.
-    if password is None:
-        password = ""
-
-    result = document.authenticate(password)
+def authenticate_document(
+    document: fitz.Document,
+    password: str | None,
+) -> int:
+    # Empty authentication also handles many owner-password-only PDFs
+    # that open normally but retain permission restrictions.
+    candidate = "" if password is None else password
+    result = document.authenticate(candidate)
 
     if document.needs_pass and result == 0:
-        raise RuntimeError("The supplied PDF password was not accepted.")
+        raise RuntimeError(
+            "The supplied PDF password was not accepted."
+        )
 
     return result
 
 
-def destination_for(source: Path, suffix: str) -> Path:
-    return source.with_name(f"{source.stem}{suffix}{source.suffix}")
+def collect_pdfs(source_root: Path) -> list[Path]:
+    if not source_root.exists():
+        raise RuntimeError(
+            f"Source folder not found: {source_root}"
+        )
+
+    if not source_root.is_dir():
+        raise RuntimeError(
+            f"Source path must be a folder: {source_root}"
+        )
+
+    return sorted(
+        (
+            path
+            for path in source_root.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() == ".pdf"
+        ),
+        key=lambda path: str(path).casefold(),
+    )
+
+
+def output_path_for(
+    source: Path,
+    source_root: Path,
+    output_root: Path,
+) -> Path:
+    relative = source.relative_to(source_root)
+    return output_root / relative
+
+
+def verify_existing_output(
+    source: Path,
+    destination: Path,
+    *,
+    password: str | None,
+) -> bool:
+    """
+    Return True when an existing destination is already a valid
+    unsecured, text-preserving copy of source.
+    """
+    try:
+        with fitz.open(source) as source_document:
+            authenticate_document(source_document, password)
+            source_states = inspect_document(source_document)
+
+        with fitz.open(destination) as output_document:
+            if (
+                output_document.needs_pass
+                or output_document.is_encrypted
+            ):
+                return False
+
+            output_states = inspect_document(output_document)
+
+        verify_text_preserved(source_states, output_states)
+        return True
+
+    except Exception:
+        return False
 
 
 def process_pdf(
     source: Path,
+    source_root: Path,
+    output_root: Path,
     *,
     password: str | None,
-    suffix: str,
     force: bool,
-    replace_original: bool,
-) -> Path:
+) -> ProcessResult:
     source = source.resolve()
+    source_root = source_root.resolve()
+    output_root = output_root.resolve()
 
-    if not source.is_file():
-        raise RuntimeError(f"PDF not found: {source}")
+    destination = output_path_for(
+        source,
+        source_root,
+        output_root,
+    )
 
-    destination = destination_for(source, suffix)
-    temporary = source.with_name(f".{source.name}.unsecured.tmp.pdf")
-    backup = source.with_name(f"{source.name}.restricted")
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    if destination.exists() and not force and not replace_original:
+    if destination.exists() and not force:
+        if verify_existing_output(
+            source,
+            destination,
+            password=password,
+        ):
+            return ProcessResult(
+                source=source,
+                destination=destination,
+                status="skipped",
+                message="Verified unsecured output already exists.",
+            )
+
         raise RuntimeError(
-            f"Destination already exists: {destination}. "
-            "Use --force only after reviewing the existing file."
+            f"Output exists but could not be verified against source: "
+            f"{destination}. Use --force only after reviewing it."
         )
+
+    temporary = destination.with_name(
+        f".{destination.name}.unsecured.tmp.pdf"
+    )
 
     temporary.unlink(missing_ok=True)
 
     try:
         with fitz.open(source) as document:
-            encryption_description = (document.metadata or {}).get("encryption")
-            originally_encrypted = bool(
-                document.is_encrypted
-                or document.needs_pass
-                or encryption_description
+            authentication_result = authenticate_document(
+                document,
+                password,
             )
-            original_permissions = document.permissions
-            authentication_result = authenticate_document(document, password)
+
             source_states = inspect_document(document)
 
-            if sum(state.positioned_words for state in source_states) == 0:
+            if sum(
+                state.positioned_words
+                for state in source_states
+            ) == 0:
                 raise RuntimeError(
-                    "The source PDF is image-only. Security removal was stopped "
-                    "because it would not make the document text-readable."
+                    "Source PDF is image-only. Security removal was "
+                    "stopped because it would not make the document "
+                    "text-readable."
                 )
 
             document.save(
@@ -170,158 +276,199 @@ def process_pdf(
             )
 
         with fitz.open(temporary) as output_document:
-            if output_document.needs_pass or output_document.is_encrypted:
-                raise RuntimeError("The saved PDF is still encrypted.")
-
-            output_states = inspect_document(output_document)
-
-        verify_text_preserved(source_states, output_states)
-
-        if replace_original:
-            if backup.exists() and not force:
+            if (
+                output_document.needs_pass
+                or output_document.is_encrypted
+            ):
                 raise RuntimeError(
-                    f"Backup already exists: {backup}. "
-                    "Nothing was replaced. Use --force only after reviewing it."
+                    "Saved PDF is still encrypted."
                 )
 
-            if backup.exists():
-                backup.unlink()
+            output_states = inspect_document(
+                output_document
+            )
 
-            os.replace(source, backup)
-            os.replace(temporary, source)
-            final_path = source
-            print(f"Original backup: {backup}")
-        else:
-            if destination.exists():
-                destination.unlink()
-            os.replace(temporary, destination)
-            final_path = destination
+        verify_text_preserved(
+            source_states,
+            output_states,
+        )
 
-        print(f"Source: {source}")
-        print(f"Authentication result: {authentication_result}")
-        print(f"Originally encrypted/restricted: {originally_encrypted}")
-        print(f"Original encryption: {encryption_description or 'None'}")
-        print(f"Original permissions value: {original_permissions}")
-        print_page_summary("Source text check:", source_states)
-        print_page_summary("Saved text check:", output_states)
-        print(f"Verified unencrypted PDF: {final_path}")
-        return final_path
+        if destination.exists():
+            destination.unlink()
+
+        os.replace(
+            temporary,
+            destination,
+        )
+
+        return ProcessResult(
+            source=source,
+            destination=destination,
+            status="created",
+            message=(
+                "Verified unsecured PDF created "
+                f"(authentication result {authentication_result})."
+            ),
+        )
 
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
 
 
-def collect_pdfs(target: Path, recursive: bool, suffix: str) -> list[Path]:
-    if target.is_file():
-        return [target]
-
-    if not target.is_dir():
-        raise RuntimeError(f"Path not found: {target}")
-
-    iterator = target.rglob("*.pdf") if recursive else target.glob("*.pdf")
-    return sorted(
-        (
-            path
-            for path in iterator
-            if path.is_file() and not path.stem.endswith(suffix)
-        ),
-        key=lambda path: str(path).casefold(),
-    )
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Save an authorized PDF without encryption or permission restrictions "
-            "while verifying that its existing text layer is preserved."
+            "Recursively create verified unsecured PDF copies while "
+            "preserving the source folder structure. Originals are "
+            "never modified."
         )
     )
-    parser.add_argument("target", type=Path, help="PDF file or folder")
+
     parser.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Process PDFs in subfolders when target is a folder",
+        "source_root",
+        nargs="?",
+        type=Path,
+        default=DEFAULT_SOURCE_ROOT,
+        help=(
+            "Folder containing secured/original PDFs. "
+            "Default: secured_input"
+        ),
     )
+
+    parser.add_argument(
+        "output_root",
+        nargs="?",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help=(
+            "Destination root for unsecured PDFs. "
+            "Default: input"
+        ),
+    )
+
     parser.add_argument(
         "--password",
         help=(
-            "PDF owner or user password. Omit this option to try an empty password "
-            "first and securely prompt only when the PDF requires one."
+            "PDF owner or user password. Omit to try an empty "
+            "password first and prompt securely only when needed."
         ),
     )
-    parser.add_argument(
-        "--suffix",
-        default="_unsecured",
-        help="Output filename suffix; default: _unsecured",
-    )
+
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Replace an existing generated output or backup",
-    )
-    parser.add_argument(
-        "--replace-original",
-        action="store_true",
         help=(
-            "After verification, replace the original filename and preserve the "
-            "restricted original as filename.pdf.restricted"
+            "Replace an existing output that does not already verify "
+            "against its source."
         ),
     )
+
     args = parser.parse_args()
 
+    source_root = args.source_root.resolve()
+    output_root = args.output_root.resolve()
+
+    if source_root == output_root:
+        print(
+            "ERROR: Source and output folders must be different.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
-        pdfs = collect_pdfs(args.target, args.recursive, args.suffix)
+        pdfs = collect_pdfs(source_root)
     except RuntimeError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(
+            f"ERROR: {exc}",
+            file=sys.stderr,
+        )
         return 1
 
     if not pdfs:
-        print("ERROR: No PDF files found.", file=sys.stderr)
-        return 1
+        print(
+            f"No PDF files found under: {source_root}"
+        )
+        return 0
 
-    failures = 0
+    created = 0
+    skipped = 0
+    failed = 0
+
+    print(f"Source root: {source_root}")
+    print(f"Output root: {output_root}")
+    print(f"PDF files found: {len(pdfs)}")
 
     for source in pdfs:
+        relative = source.relative_to(source_root)
+
         print("=" * 72)
-        print(f"Processing: {source}")
+        print(f"Processing: {relative}")
 
         password = args.password
 
         try:
-            # First try without prompting. If the PDF truly requires a password,
-            # reopen it after prompting so the password is not exposed on-screen.
             try:
-                process_pdf(
+                result = process_pdf(
                     source,
+                    source_root,
+                    output_root,
                     password=password,
-                    suffix=args.suffix,
                     force=args.force,
-                    replace_original=args.replace_original,
                 )
+
             except RuntimeError as exc:
-                if password is None and "password was not accepted" in str(exc):
+                if (
+                    password is None
+                    and "password was not accepted" in str(exc)
+                ):
                     password = getpass.getpass(
-                        f"Password for {source.name}: "
+                        f"Password for {relative}: "
                     )
-                    process_pdf(
+
+                    result = process_pdf(
                         source,
+                        source_root,
+                        output_root,
                         password=password,
-                        suffix=args.suffix,
                         force=args.force,
-                        replace_original=args.replace_original,
                     )
                 else:
                     raise
 
+            if result.status == "created":
+                created += 1
+                print(
+                    f"CREATED: {relative}"
+                )
+                print(
+                    f"         {result.destination}"
+                )
+
+            elif result.status == "skipped":
+                skipped += 1
+                print(
+                    f"SKIPPED: {relative}"
+                )
+                print(
+                    f"         {result.message}"
+                )
+
         except Exception as exc:
-            failures += 1
-            print(f"FAILED: {exc}", file=sys.stderr)
+            failed += 1
+            print(
+                f"FAILED: {relative} | {exc}",
+                file=sys.stderr,
+            )
 
     print("=" * 72)
-    print(f"Processed: {len(pdfs) - failures}")
-    print(f"Failed: {failures}")
-    return 1 if failures else 0
+    print("SUMMARY")
+    print(f"PDF files found: {len(pdfs)}")
+    print(f"Created: {created}")
+    print(f"Skipped: {skipped}")
+    print(f"Failed: {failed}")
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
