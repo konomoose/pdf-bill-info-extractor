@@ -50,8 +50,8 @@ class PDFSecurityRemovalTest(unittest.TestCase):
     def test_recursive_processing_preserves_relative_structure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_folder:
             root = Path(temporary_folder)
-            secured = root / "secured_input"
-            output = root / "input"
+            secured = root / "source_input"
+            output = root / "editable_input"
 
             source_one = secured / "rbc" / "2025" / "jan.pdf"
             source_two = (
@@ -158,8 +158,8 @@ class PDFSecurityRemovalTest(unittest.TestCase):
     def test_second_run_skips_verified_existing_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_folder:
             root = Path(temporary_folder)
-            secured = root / "secured_input"
-            output = root / "input"
+            secured = root / "source_input"
+            output = root / "editable_input"
 
             source = (
                 secured

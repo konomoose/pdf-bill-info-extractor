@@ -16,7 +16,7 @@ KNOWN_PDF_NAME = "1onlineStatement_2024-03-23.pdf"
 KNOWN_CSV_NAME = "1onlineStatement_2024-03-23_transactions.csv"
 
 TEST_INPUT_ROOT = PROJECT_ROOT / "tests" / "input" / "cibc"
-NORMAL_INPUT_ROOT = PROJECT_ROOT / "input" / "cibc"
+NORMAL_INPUT_ROOT = PROJECT_ROOT / "editable_input" / "cibc"
 REFERENCE_CSV = (
     PROJECT_ROOT / "tests" / "reference_output" / "cibc" / KNOWN_CSV_NAME
 )
@@ -56,7 +56,7 @@ class CIBCCreditCardProfileTest(unittest.TestCase):
         if cls.pdf_path is None:
             raise unittest.SkipTest(
                 "CIBC regression PDF not found. Set CIBC_TEST_PDF, or place "
-                f"{KNOWN_PDF_NAME} under tests/input/cibc or input/cibc."
+                f"{KNOWN_PDF_NAME} under tests/input/cibc or editable_input/cibc."
             )
 
         cls.profile = load_profile(PROFILE_PATH)
@@ -79,11 +79,11 @@ class CIBCCreditCardProfileTest(unittest.TestCase):
     def test_profile_paths_and_folder_processing(self) -> None:
         self.assertEqual(
             self.profile.resolve_input_folder(),
-            (PROJECT_ROOT / "input" / "cibc").resolve(),
+            (PROJECT_ROOT / "editable_input" / "cibc").resolve(),
         )
         self.assertEqual(
             self.profile.resolve_output_folder(),
-            (PROJECT_ROOT / "output" / "cibc").resolve(),
+            (PROJECT_ROOT / "csv_output" / "cibc").resolve(),
         )
         self.assertTrue(self.profile.recursive)
         self.assertTrue(self.profile.preserve_subfolders)

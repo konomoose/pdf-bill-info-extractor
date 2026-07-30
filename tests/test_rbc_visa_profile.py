@@ -15,7 +15,7 @@ PROFILE_PATH = PROJECT_ROOT / "config" / "profiles" / "rbc_visa_credit_card.json
 KNOWN_PDF_NAME = "Visa Statement-7498 2025-01-09_unsecured_Redacted.pdf"
 
 TEST_INPUT_ROOT = PROJECT_ROOT / "tests" / "input" / "rbc"
-NORMAL_INPUT_ROOT = PROJECT_ROOT / "input" / "rbc"
+NORMAL_INPUT_ROOT = PROJECT_ROOT / "editable_input" / "rbc"
 TEST_OUTPUT_ROOT = PROJECT_ROOT / "tests" / "output" / "rbc"
 
 EXPECTED_COLUMNS = [
@@ -76,11 +76,11 @@ class RBCVisaProfileTest(unittest.TestCase):
 
         self.assertEqual(
             self.profile.resolve_input_folder(),
-            (PROJECT_ROOT / "input" / "rbc").resolve(),
+            (PROJECT_ROOT / "editable_input" / "rbc").resolve(),
         )
         self.assertEqual(
             self.profile.resolve_output_folder(),
-            (PROJECT_ROOT / "output" / "rbc").resolve(),
+            (PROJECT_ROOT / "csv_output" / "rbc").resolve(),
         )
 
         self.assertTrue(self.profile.recursive)

@@ -1,20 +1,32 @@
 
+# Python virtual environments
+.venv/
+venv/
+
 # Python cache files
 __pycache__/
 *.py[cod]
-/secured_input/**
-!/secured_input/.gitkeep
 .pytest_cache/
 
-# Institution source statements
-input/**/*
-!input/**/
-!input/**/.gitkeep
+# Original institution source statements
+source_input/**/*
+!source_input/**/
+!source_input/**/.gitkeep
+
+# Security-removed working statements
+editable_input/**/*
+!editable_input/**/
+!editable_input/**/.gitkeep
+
+# Redacted working statements
+redacted_input/**/*
+!redacted_input/**/
+!redacted_input/**/.gitkeep
 
 # Generated extraction output
-output/**/*
-!output/**/
-!output/**/.gitkeep
+csv_output/**/*
+!csv_output/**/
+!csv_output/**/.gitkeep
 
 # Local regression-test statements
 tests/input/**/*

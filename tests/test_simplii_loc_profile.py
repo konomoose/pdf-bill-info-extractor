@@ -17,7 +17,7 @@ PROFILE_PATH = (
 TEST_PDF = (
     PROJECT_ROOT
     / "tests"
-    / "input"
+    / "editable_input"
     / "simplii_loc"
     / "full-text-test"
     / "01-jan-2025_Redacted.pdf"
@@ -25,7 +25,7 @@ TEST_PDF = (
 
 NORMAL_PDF = (
     PROJECT_ROOT
-    / "input"
+    / "editable_input"
     / "simplii_loc"
     / "01-jan-2025.pdf"
 )
@@ -93,12 +93,12 @@ class SimpliiLOCProfileTest(unittest.TestCase):
 
         self.assertEqual(
             self.profile.resolve_input_folder(),
-            (PROJECT_ROOT / "input" / "simplii_loc").resolve(),
+            (PROJECT_ROOT / "editable_input" / "simplii_loc").resolve(),
         )
 
         self.assertEqual(
             self.profile.resolve_output_folder(),
-            (PROJECT_ROOT / "output" / "simplii_loc").resolve(),
+            (PROJECT_ROOT / "csv_output" / "simplii_loc").resolve(),
         )
 
         self.assertTrue(self.profile.recursive)

@@ -16,7 +16,7 @@ KNOWN_PDF_NAME = "01-jan-2025.pdf"
 KNOWN_CSV_NAME = "01-jan-2025_transactions.csv"
 
 TEST_INPUT_ROOT = PROJECT_ROOT / "tests" / "input" / "simplii"
-NORMAL_INPUT_ROOT = PROJECT_ROOT / "input" / "simplii"
+NORMAL_INPUT_ROOT = PROJECT_ROOT / "editable_input" / "simplii"
 TEST_OUTPUT_ROOT = PROJECT_ROOT / "tests" / "output" / "simplii"
 REFERENCE_CSV = (
     PROJECT_ROOT / "tests" / "reference_output" / "simplii" / KNOWN_CSV_NAME
@@ -69,7 +69,7 @@ class SimpliiChequingProfileTest(unittest.TestCase):
         if cls.pdf_path is None:
             raise unittest.SkipTest(
                 "Simplii regression PDF not found. Place "
-                f"{KNOWN_PDF_NAME} under tests/input/simplii or input/simplii."
+                f"{KNOWN_PDF_NAME} under tests/input/simplii or editable_input/simplii."
             )
 
         cls.profile = load_profile(PROFILE_PATH)
@@ -93,11 +93,11 @@ class SimpliiChequingProfileTest(unittest.TestCase):
         self.assertEqual(self.profile.parser, "simplii_chequing_account")
         self.assertEqual(
             self.profile.resolve_input_folder(),
-            (PROJECT_ROOT / "input" / "simplii").resolve(),
+            (PROJECT_ROOT / "editable_input" / "simplii").resolve(),
         )
         self.assertEqual(
             self.profile.resolve_output_folder(),
-            (PROJECT_ROOT / "output" / "simplii").resolve(),
+            (PROJECT_ROOT / "csv_output" / "simplii").resolve(),
         )
         self.assertTrue(self.profile.recursive)
         self.assertTrue(self.profile.preserve_subfolders)

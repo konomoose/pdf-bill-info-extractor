@@ -11,8 +11,8 @@ from pathlib import Path
 import fitz  # PyMuPDF
 
 
-DEFAULT_SOURCE_ROOT = Path("secured_input")
-DEFAULT_OUTPUT_ROOT = Path("input")
+DEFAULT_SOURCE_ROOT = Path("source_input")
+DEFAULT_OUTPUT_ROOT = Path("editable_input")
 
 
 @dataclass(frozen=True)
@@ -331,8 +331,8 @@ def main() -> int:
         type=Path,
         default=DEFAULT_SOURCE_ROOT,
         help=(
-            "Folder containing secured/original PDFs. "
-            "Default: secured_input"
+            "Folder containing original/source PDFs. "
+            "Default: source_input"
         ),
     )
 
@@ -342,8 +342,8 @@ def main() -> int:
         type=Path,
         default=DEFAULT_OUTPUT_ROOT,
         help=(
-            "Destination root for unsecured PDFs. "
-            "Default: input"
+            "Destination root for editable, unsecured PDFs. "
+            "Default: editable_input"
         ),
     )
 

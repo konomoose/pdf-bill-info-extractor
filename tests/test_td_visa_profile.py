@@ -16,7 +16,7 @@ KNOWN_PDF_NAME = "tk-td-visa.pdf"
 KNOWN_CSV_NAME = "tk-td-visa_transactions.csv"
 
 TEST_INPUT_ROOT = PROJECT_ROOT / "tests" / "input" / "td_visa"
-NORMAL_INPUT_ROOT = PROJECT_ROOT / "input" / "td_visa"
+NORMAL_INPUT_ROOT = PROJECT_ROOT / "editable_input" / "td_visa"
 TEST_OUTPUT_ROOT = PROJECT_ROOT / "tests" / "output" / "td_visa"
 REFERENCE_CSV = (
     PROJECT_ROOT / "tests" / "reference_output" / "td_visa" / KNOWN_CSV_NAME
@@ -196,11 +196,11 @@ class TDVisaProfileTest(unittest.TestCase):
         self.assertEqual(self.profile.parser, "td_visa_credit_card")
         self.assertEqual(
             self.profile.resolve_input_folder(),
-            (PROJECT_ROOT / "input" / "td_visa").resolve(),
+            (PROJECT_ROOT / "editable_input" / "td_visa").resolve(),
         )
         self.assertEqual(
             self.profile.resolve_output_folder(),
-            (PROJECT_ROOT / "output" / "td_visa").resolve(),
+            (PROJECT_ROOT / "csv_output" / "td_visa").resolve(),
         )
         self.assertTrue(self.profile.recursive)
         self.assertTrue(self.profile.preserve_subfolders)

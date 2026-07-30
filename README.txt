@@ -24,10 +24,19 @@ Project folders
 config/profiles/
     Saved institution profiles.
 
-input/<institution>/<year>/
-    Source PDF statements. These files are ignored by Git.
+source_input/<institution>/<year>/
+    Original PDF statements exactly as received from the institution.
+    These files are preserved and ignored by Git.
 
-output/<institution>/<year>/
+editable_input/<institution>/<year>/
+    Verified unrestricted working copies created from source_input.
+    Extraction profiles read PDFs from this folder. These files are ignored by Git.
+
+redacted_input/<institution>/<year>/
+    Sanitized copies created from editable_input for development,
+    troubleshooting, and regression-test preparation. These files are ignored by Git.
+
+csv_output/<institution>/<year>/
     Per-statement transaction CSV files and batch summaries.
     These files are ignored by Git.
 
@@ -48,18 +57,26 @@ tests/tools/
 
 CIBC example
 ------------
-Place statements under:
+Place original statements under:
 
-    input/cibc/2024/
+    source_input/cibc/2024/
 
-Run:
+Create or verify unrestricted working copies:
+
+    python tests/tools/remove_pdf_security.py
+
+The matching working PDFs are created under:
+
+    editable_input/cibc/2024/
+
+Run extraction:
 
     python visa_pdf_extractor-v3.py
 
 Select the CIBC profile and PDF folder mode. The application scans year
-subfolders and mirrors them under:
+subfolders under editable_input and mirrors them under:
 
-    output/cibc/2024/
+    csv_output/cibc/2024/
 
 Regression test
 ---------------
@@ -67,7 +84,7 @@ Regression test
 
 PDF text diagnostic
 -------------------
-    python tests/tools/diagnose_pdf_text.py input/cibc
+    python tests/tools/diagnose_pdf_text.py editable_input/cibc
 
 Privacy
 -------

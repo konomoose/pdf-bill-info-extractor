@@ -12,11 +12,11 @@ Normal input and output
 -----------------------
 Place TD Visa statements under:
 
-    input/td_visa/<year>/
+    editable_input/td_visa/<year>/
 
 Generated statement CSV files are written under:
 
-    output/td_visa/<year>/
+    csv_output/td_visa/<year>/
 
 Local regression test
 ---------------------
