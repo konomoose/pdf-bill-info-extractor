@@ -53,9 +53,18 @@ def _require_string(data: dict[str, Any], key: str) -> str:
     return value.strip()
 
 
-def _require_string_list(data: dict[str, Any], key: str) -> tuple[str, ...]:
+def _require_string_list(
+    data: dict[str, Any],
+    key: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
     value = data.get(key)
-    if not isinstance(value, list) or not value:
+
+    if not isinstance(value, list):
+        raise ProfileError(f"Profile field '{key}' must be a list.")
+
+    if not value and not allow_empty:
         raise ProfileError(f"Profile field '{key}' must be a non-empty list.")
 
     cleaned: list[str] = []
@@ -129,7 +138,11 @@ def load_profile(profile_path: str | Path | None = None) -> ExtractionProfile:
         recursive=recursive,
         preserve_subfolders=preserve_subfolders,
         required_headers=_require_string_list(data, "required_headers"),
-        excluded_page_phrases=_require_string_list(data, "excluded_page_phrases"),
+        excluded_page_phrases=_require_string_list(
+            data,
+            "excluded_page_phrases",
+            allow_empty=True,
+        ),
         line_tolerance=line_tolerance,
         continuation_gap=continuation_gap,
         source_path=path,

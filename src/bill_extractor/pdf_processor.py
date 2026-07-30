@@ -25,6 +25,11 @@ MONTHS = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
 DATE_RE = re.compile(rf"^{MONTHS}\s+\d{{1,2}}$")
 AMOUNT_RE = re.compile(r"^-?\$?\d[\d,]*\.\d{2}(?:\*+)?$")
 
+RBC_CHQ_DATE_RE = re.compile(
+    rf"^(\d{{1,2}})\s+({MONTHS})$",
+    re.IGNORECASE,
+)
+
 RBC_ROW_RE = re.compile(
     rf"^({MONTHS})\s+(\d{{1,2}})\s+"
     rf"({MONTHS})\s+(\d{{1,2}})\s+"
@@ -40,6 +45,29 @@ RBC_PREVIOUS_BALANCE_RE = re.compile(
 RBC_TOTAL_BALANCE_RE = re.compile(
     r"Total\s+Account\s+Balance\s+"
     r"(-?\$?\d[\d,]*\.\d{2})",
+    re.IGNORECASE,
+)
+
+RBC_CHQ_OPENING_BALANCE_RE = re.compile(
+    r"Your\s+opening\s+balance\s+on\s+"
+    r"[A-Za-z]+\s+\d{1,2},\s+\d{4}\s+"
+    r"\$?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+RBC_CHQ_TOTAL_DEPOSITS_RE = re.compile(
+    r"Total\s+deposits\s+into\s+your\s+account\s+"
+    r"\+?\s*\$?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+RBC_CHQ_TOTAL_WITHDRAWALS_RE = re.compile(
+    r"Total\s+withdrawals\s+from\s+your\s+account\s+"
+    r"-?\s*\$?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+RBC_CHQ_CLOSING_BALANCE_RE = re.compile(
+    r"Your\s+closing\s+balance\s+on\s+"
+    r"[A-Za-z]+\s+\d{1,2},\s+\d{4}\s+"
+    r"=?\s*\$?([\d,]+\.\d{2})",
     re.IGNORECASE,
 )
 SIMPLII_BALANCE_RE = re.compile(
@@ -65,6 +93,7 @@ SUPPORTED_PARSERS = {
     "simplii_chequing_account",
     "td_visa_credit_card",
     "rbc_visa_credit_card",
+    "rbc_chequing_account",
 }
 
 
@@ -187,8 +216,14 @@ class VisaPDFProcessor:
         return lines
 
     def _page_is_excluded(self, page_text: str) -> bool:
+        if not self.excluded_page_phrases:
+            return False
+
         lowered = page_text.lower()
-        return all(phrase.lower() in lowered for phrase in self.excluded_page_phrases)
+        return all(
+            phrase.lower() in lowered
+            for phrase in self.excluded_page_phrases
+        )
 
     # CIBC credit-card parser -------------------------------------------------
 
@@ -1167,6 +1202,324 @@ class VisaPDFProcessor:
                 "transaction page."
             )
 
+    # RBC Chequing parser ----------------------------------------------------
+
+    @staticmethod
+    def _normalize_rbc_chequing_date(day: str, month: str) -> str:
+        return f"{int(day)} {month.title()}"
+
+    def _find_rbc_chequing_header(self, page: fitz.Page) -> dict | None:
+        """Locate the RBC Chequing transaction table columns."""
+        lines = self._group_words_into_lines(page.get_text("words"))
+
+        for line in lines:
+            words = line["words"]
+            tokens = {str(word[4]).lower() for word in words}
+
+            required = {
+                "date",
+                "description",
+                "withdrawals",
+                "deposits",
+                "balance",
+            }
+            if not required.issubset(tokens):
+                continue
+
+            def find_word(value: str) -> tuple | None:
+                return next(
+                    (
+                        word
+                        for word in words
+                        if str(word[4]).lower() == value
+                    ),
+                    None,
+                )
+
+            date = find_word("date")
+            description = find_word("description")
+            withdrawals = find_word("withdrawals")
+            deposits = find_word("deposits")
+            balance = find_word("balance")
+
+            if not all((date, description, withdrawals, deposits, balance)):
+                continue
+
+            positions = [
+                date[0],
+                description[0],
+                withdrawals[0],
+                deposits[0],
+                balance[0],
+            ]
+
+            if positions != sorted(positions):
+                continue
+
+            return {
+                "date": date[0],
+                "description": description[0],
+                "withdrawals": withdrawals[0],
+                "deposits": deposits[0],
+                "balance": balance[0],
+                "bottom": max(word[3] for word in words),
+            }
+
+        return None
+
+    def _line_to_rbc_chequing_cells(
+        self,
+        line: dict,
+        header: dict,
+    ) -> dict[str, str]:
+        cells = {
+            "date": [],
+            "description": [],
+            "withdrawals": [],
+            "deposits": [],
+            "balance": [],
+        }
+
+        for word in line["words"]:
+            text = str(word[4])
+            x_center = self._word_center_x(word)
+
+            # Ignore RBC form/control text left of the Date column.
+            if x_center < header["date"]:
+                continue
+
+            if x_center < header["description"]:
+                cells["date"].append(text)
+            elif x_center < header["withdrawals"]:
+                cells["description"].append(text)
+            elif x_center < header["deposits"]:
+                cells["withdrawals"].append(text)
+            elif x_center < header["balance"]:
+                cells["deposits"].append(text)
+            else:
+                cells["balance"].append(text)
+
+        return {
+            key: self._normalize_text(" ".join(parts))
+            for key, parts in cells.items()
+        }
+
+    def _extract_rbc_chequing_page_transactions(
+        self,
+        page: fitz.Page,
+        current_date: str | None,
+        pending_description: str,
+    ) -> tuple[list[dict[str, str]], str | None, str]:
+        """Extract RBC Chequing transactions and preserve state across pages."""
+        if self._page_is_excluded(page.get_text("text")):
+            return [], current_date, pending_description
+
+        header = self._find_rbc_chequing_header(page)
+        if header is None:
+            return [], current_date, pending_description
+
+        words = [
+            word
+            for word in page.get_text("words")
+            if word[1] >= header["bottom"] - 1
+        ]
+        lines = self._group_words_into_lines(words)
+
+        rows: list[dict[str, str]] = []
+
+        for line in lines:
+            if line["y_center"] <= header["bottom"] + 1:
+                continue
+
+            cells = self._line_to_rbc_chequing_cells(line, header)
+
+            joined = self._normalize_text(
+                " ".join(value for value in cells.values() if value)
+            )
+            lowered = joined.lower()
+
+            if not joined:
+                continue
+
+            if "closing balance" in lowered:
+                pending_description = ""
+                break
+
+            if lowered.startswith("please check this account statement"):
+                pending_description = ""
+                break
+
+            if "opening balance" in lowered:
+                pending_description = ""
+                continue
+
+            date_match = RBC_CHQ_DATE_RE.fullmatch(cells["date"])
+
+            if cells["date"] and date_match is None:
+                continue
+
+            if date_match:
+                current_date = self._normalize_rbc_chequing_date(
+                    date_match.group(1),
+                    date_match.group(2),
+                )
+
+            withdrawal_valid = bool(
+                AMOUNT_RE.fullmatch(cells["withdrawals"])
+            )
+            deposit_valid = bool(
+                AMOUNT_RE.fullmatch(cells["deposits"])
+            )
+
+            if withdrawal_valid and deposit_valid:
+                raise PDFProcessingError(
+                    "RBC Chequing row contains both a withdrawal and deposit."
+                )
+
+            description = cells["description"]
+
+            # Description can begin on one visual line and finish on the next.
+            if not withdrawal_valid and not deposit_valid:
+                if description:
+                    pending_description = self._normalize_text(
+                        f"{pending_description} {description}"
+                    )
+                continue
+
+            if current_date is None:
+                raise PDFProcessingError(
+                    "RBC Chequing transaction found before a date was established."
+                )
+
+            full_description = self._normalize_text(
+                f"{pending_description} {description}"
+            )
+
+            if not full_description:
+                raise PDFProcessingError(
+                    "RBC Chequing transaction amount found without a description."
+                )
+
+            rows.append(
+                {
+                    "Date": current_date,
+                    "Description": full_description,
+                    "Withdrawals ($)": (
+                        cells["withdrawals"].replace("$", "").rstrip("*")
+                        if withdrawal_valid
+                        else ""
+                    ),
+                    "Deposits ($)": (
+                        cells["deposits"].replace("$", "").rstrip("*")
+                        if deposit_valid
+                        else ""
+                    ),
+                    "Balance ($)": (
+                        cells["balance"].replace("$", "").rstrip("*")
+                        if AMOUNT_RE.fullmatch(cells["balance"])
+                        else ""
+                    ),
+                }
+            )
+
+            pending_description = ""
+
+        return rows, current_date, pending_description
+
+    def _extract_rbc_chequing_summary(
+        self,
+        page_text: str,
+    ) -> tuple[
+        Decimal | None,
+        Decimal | None,
+        Decimal | None,
+        Decimal | None,
+    ]:
+        """Extract RBC Chequing opening, deposits, withdrawals, and closing totals."""
+        normalized = self._normalize_text(page_text)
+
+        def get_amount(pattern: re.Pattern[str]) -> Decimal | None:
+            match = pattern.search(normalized)
+            if match is None:
+                return None
+            return self._parse_amount(match.group(1))
+
+        return (
+            get_amount(RBC_CHQ_OPENING_BALANCE_RE),
+            get_amount(RBC_CHQ_TOTAL_DEPOSITS_RE),
+            get_amount(RBC_CHQ_TOTAL_WITHDRAWALS_RE),
+            get_amount(RBC_CHQ_CLOSING_BALANCE_RE),
+        )
+
+    def _validate_rbc_chequing_totals(
+        self,
+        transactions: pd.DataFrame,
+        opening_balance: Decimal | None,
+        statement_deposits: Decimal | None,
+        statement_withdrawals: Decimal | None,
+        closing_balance: Decimal | None,
+    ) -> None:
+        """Verify RBC Chequing extraction against the statement summary."""
+        if any(
+            value is None
+            for value in (
+                opening_balance,
+                statement_deposits,
+                statement_withdrawals,
+                closing_balance,
+            )
+        ):
+            raise PDFProcessingError(
+                "RBC Chequing statement totals were not found. Extraction was not "
+                "accepted because completeness could not be verified."
+            )
+
+        extracted_withdrawals = sum(
+            (
+                self._parse_amount(value)
+                for value in transactions["Withdrawals ($)"]
+                if value
+            ),
+            Decimal("0.00"),
+        )
+
+        extracted_deposits = sum(
+            (
+                self._parse_amount(value)
+                for value in transactions["Deposits ($)"]
+                if value
+            ),
+            Decimal("0.00"),
+        )
+
+        if (
+            extracted_deposits != statement_deposits
+            or extracted_withdrawals != statement_withdrawals
+        ):
+            raise PDFProcessingError(
+                "RBC Chequing extraction totals do not match the statement totals. "
+                f"Extracted deposits: ${extracted_deposits:,.2f}; statement: "
+                f"${statement_deposits:,.2f}. Extracted withdrawals: "
+                f"${extracted_withdrawals:,.2f}; statement: "
+                f"${statement_withdrawals:,.2f}."
+            )
+
+        calculated_closing = (
+            opening_balance
+            + statement_deposits
+            - statement_withdrawals
+        )
+
+        if calculated_closing != closing_balance:
+            raise PDFProcessingError(
+                "RBC Chequing statement summary does not reconcile. "
+                f"Opening balance: ${opening_balance:,.2f}; deposits: "
+                f"${statement_deposits:,.2f}; withdrawals: "
+                f"${statement_withdrawals:,.2f}; calculated closing balance: "
+                f"${calculated_closing:,.2f}; statement closing balance: "
+                f"${closing_balance:,.2f}."
+            )
+
     # Shared processing -------------------------------------------------------
 
     def extract_transactions(self, pdf_path: str | Path) -> ExtractionResult:
@@ -1192,6 +1545,13 @@ class VisaPDFProcessor:
         td_new_balance: Decimal | None = None
         rbc_previous_balance: Decimal | None = None
         rbc_total_balance: Decimal | None = None
+
+        rbc_chq_opening_balance: Decimal | None = None
+        rbc_chq_total_deposits: Decimal | None = None
+        rbc_chq_total_withdrawals: Decimal | None = None
+        rbc_chq_closing_balance: Decimal | None = None
+        rbc_chq_current_date: str | None = None
+        rbc_chq_pending_description = ""
 
         try:
             with fitz.open(source_path) as document:
@@ -1229,6 +1589,32 @@ class VisaPDFProcessor:
                         if page_total_balance is not None:
                             rbc_total_balance = page_total_balance
                         page_rows = self._extract_rbc_page_transactions(page)
+                    elif self.profile.parser == "rbc_chequing_account":
+                        (
+                            page_opening,
+                            page_deposits,
+                            page_withdrawals,
+                            page_closing,
+                        ) = self._extract_rbc_chequing_summary(page_text)
+
+                        if page_opening is not None:
+                            rbc_chq_opening_balance = page_opening
+                        if page_deposits is not None:
+                            rbc_chq_total_deposits = page_deposits
+                        if page_withdrawals is not None:
+                            rbc_chq_total_withdrawals = page_withdrawals
+                        if page_closing is not None:
+                            rbc_chq_closing_balance = page_closing
+
+                        (
+                            page_rows,
+                            rbc_chq_current_date,
+                            rbc_chq_pending_description,
+                        ) = self._extract_rbc_chequing_page_transactions(
+                            page,
+                            rbc_chq_current_date,
+                            rbc_chq_pending_description,
+                        )
                     else:
                         raise PDFProcessingError(
                             f"Unsupported parser '{self.profile.parser}'."
@@ -1285,6 +1671,14 @@ class VisaPDFProcessor:
                 transactions,
                 rbc_previous_balance,
                 rbc_total_balance,
+            )
+        elif self.profile.parser == "rbc_chequing_account":
+            self._validate_rbc_chequing_totals(
+                transactions,
+                rbc_chq_opening_balance,
+                rbc_chq_total_deposits,
+                rbc_chq_total_withdrawals,
+                rbc_chq_closing_balance,
             )
 
         return ExtractionResult(
