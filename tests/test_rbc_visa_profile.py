@@ -14,9 +14,9 @@ PROFILE_PATH = PROJECT_ROOT / "config" / "profiles" / "rbc_visa_credit_card.json
 
 KNOWN_PDF_NAME = "Visa Statement-7498 2025-01-09_unsecured_Redacted.pdf"
 
-TEST_INPUT_ROOT = PROJECT_ROOT / "tests" / "input" / "rbc"
-NORMAL_INPUT_ROOT = PROJECT_ROOT / "editable_input" / "rbc"
-TEST_OUTPUT_ROOT = PROJECT_ROOT / "tests" / "output" / "rbc"
+TEST_INPUT_ROOT = PROJECT_ROOT / "tests" / "input" / "rbc_visa"
+NORMAL_INPUT_ROOT = PROJECT_ROOT / "editable_input" / "rbc_visa"
+TEST_OUTPUT_ROOT = PROJECT_ROOT / "tests" / "output" / "rbc_visa"
 
 EXPECTED_COLUMNS = [
     "Transaction date",
@@ -54,7 +54,7 @@ class RBCVisaProfileTest(unittest.TestCase):
         if cls.pdf_path is None:
             raise unittest.SkipTest(
                 "RBC Visa regression PDF not found. Place the redacted full-text "
-                "statement under tests/input/rbc/full-text-test."
+                "statement under tests/input/rbc_visa/full-text-test."
             )
 
         cls.profile = load_profile(PROFILE_PATH)
@@ -76,11 +76,11 @@ class RBCVisaProfileTest(unittest.TestCase):
 
         self.assertEqual(
             self.profile.resolve_input_folder(),
-            (PROJECT_ROOT / "editable_input" / "rbc").resolve(),
+            (PROJECT_ROOT / "editable_input" / "rbc_visa").resolve(),
         )
         self.assertEqual(
             self.profile.resolve_output_folder(),
-            (PROJECT_ROOT / "csv_output" / "rbc").resolve(),
+            (PROJECT_ROOT / "csv_output" / "rbc_visa").resolve(),
         )
 
         self.assertTrue(self.profile.recursive)
