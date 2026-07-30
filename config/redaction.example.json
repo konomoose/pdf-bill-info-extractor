@@ -1,0 +1,14 @@
+{
+  "global_terms": [
+    "EXAMPLE CUSTOMER NAME"
+  ],
+  "institution_terms": {
+    "rbc": [
+      "0000 0000 0000 0000"
+    ],
+    "cibc": [],
+    "simplii": [],
+    "simplii_loc": [],
+    "td_visa": []
+  }
+}

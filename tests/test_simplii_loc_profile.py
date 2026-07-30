@@ -17,7 +17,7 @@ PROFILE_PATH = (
 TEST_PDF = (
     PROJECT_ROOT
     / "tests"
-    / "editable_input"
+    / "input"
     / "simplii_loc"
     / "full-text-test"
     / "01-jan-2025_Redacted.pdf"
@@ -27,6 +27,7 @@ NORMAL_PDF = (
     PROJECT_ROOT
     / "editable_input"
     / "simplii_loc"
+    / "2025"
     / "01-jan-2025.pdf"
 )
 
