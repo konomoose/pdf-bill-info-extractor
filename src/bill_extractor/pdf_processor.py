@@ -270,12 +270,17 @@ class VisaPDFProcessor:
         for index, line in enumerate(lines):
             line_text = " ".join(word[4] for word in line["words"]).lower()
 
-            if not all(
-                token in line_text for token in ("description", "spend", "categories")
-            ):
+            if "description" not in line_text or "amount" not in line_text:
                 continue
 
-            if "amount" not in line_text:
+            allow_missing_spend = self.profile.profile_id.startswith("simplii_visa")
+
+            has_spend_header = (
+                "spend" in line_text
+                and "categories" in line_text
+            )
+
+            if not has_spend_header and not allow_missing_spend:
                 continue
 
             nearby_lines = lines[max(0, index - 1) : index + 1]
@@ -304,10 +309,19 @@ class VisaPDFProcessor:
                 None,
             )
 
-            if not all((trans, post, description, spend, amount)):
+            if not all((trans, post, description, amount)):
                 continue
 
-            x_positions = [trans[0], post[0], description[0], spend[0], amount[0]]
+            if spend is None and not allow_missing_spend:
+                continue
+
+            x_positions = [trans[0], post[0], description[0]]
+
+            if spend is not None:
+                x_positions.append(spend[0])
+
+            x_positions.append(amount[0])
+
             if x_positions != sorted(x_positions):
                 continue
 
@@ -315,7 +329,7 @@ class VisaPDFProcessor:
                 "trans": trans[0],
                 "post": post[0],
                 "description": description[0],
-                "spend": spend[0],
+                "spend": spend[0] if spend is not None else None,
                 "amount": amount[0],
                 "bottom": max(word[3] for word in nearby_words),
             }
@@ -342,6 +356,11 @@ class VisaPDFProcessor:
                 cells["trans"].append(text)
             elif x_position < header["description"]:
                 cells["post"].append(text)
+            elif header["spend"] is None:
+                if x_position < header["amount"]:
+                    cells["description"].append(text)
+                else:
+                    cells["amount"].append(text)
             elif x_position < header["spend"]:
                 cells["description"].append(text)
             elif x_position < header["amount"]:
