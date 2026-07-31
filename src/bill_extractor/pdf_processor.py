@@ -140,6 +140,7 @@ SUPPORTED_PARSERS = {
     "rbc_chequing_account",
     "rbc_loc",
     "triangle_mastercard",
+    "capital_one_mastercard",
 }
 
 
@@ -744,6 +745,510 @@ class VisaPDFProcessor:
                         )
                     )
                     last_row_y = y_center
+
+        return rows
+
+
+    # Capital One Mastercard parser ------------------------------------------
+
+    def _find_capital_one_modern_headers(
+        self,
+        page: fitz.Page,
+    ) -> list[dict]:
+        """Find modern Capital One transaction-table headers."""
+        lines = self._group_words_into_lines(page.get_text("words"))
+        headers: list[dict] = []
+
+        for index in range(len(lines)):
+            # Allow the PDF producer to split a visual header across a few
+            # closely spaced text lines.
+            for window_size in range(1, 4):
+                window = lines[index : index + window_size]
+                if len(window) != window_size:
+                    continue
+
+                words = [
+                    word
+                    for line in window
+                    for word in line["words"]
+                ]
+                tokens = [
+                    str(word[4]).strip().lower()
+                    for word in words
+                ]
+
+                if not all(
+                    token in tokens
+                    for token in (
+                        "transaction",
+                        "posting",
+                        "description",
+                        "amount",
+                    )
+                ):
+                    continue
+
+                if tokens.count("date") < 2:
+                    continue
+
+                transaction_candidates = [
+                    word
+                    for word in words
+                    if str(word[4]).strip().lower() == "transaction"
+                    and word[0] < 90
+                ]
+                posting_candidates = [
+                    word
+                    for word in words
+                    if str(word[4]).strip().lower() == "posting"
+                    and 100 <= word[0] < 190
+                ]
+                description_candidates = [
+                    word
+                    for word in words
+                    if str(word[4]).strip().lower() == "description"
+                    and 175 <= word[0] < 320
+                ]
+                amount_candidates = [
+                    word
+                    for word in words
+                    if str(word[4]).strip().lower() == "amount"
+                    and word[0] > 450
+                ]
+
+                if not all(
+                    (
+                        transaction_candidates,
+                        posting_candidates,
+                        description_candidates,
+                        amount_candidates,
+                    )
+                ):
+                    continue
+
+                transaction = min(
+                    transaction_candidates,
+                    key=lambda word: word[0],
+                )
+                posting = min(
+                    posting_candidates,
+                    key=lambda word: word[0],
+                )
+                description = min(
+                    description_candidates,
+                    key=lambda word: word[0],
+                )
+                amount = min(
+                    amount_candidates,
+                    key=lambda word: word[0],
+                )
+
+                anchors = [
+                    transaction[0],
+                    posting[0],
+                    description[0],
+                    amount[0],
+                ]
+                if anchors != sorted(anchors):
+                    continue
+
+                header = {
+                    "trans": transaction[0],
+                    "post": posting[0],
+                    "description": description[0],
+                    "amount": amount[0],
+                    "top": min(word[1] for word in words),
+                    "bottom": max(word[3] for word in words),
+                }
+
+                # Do not add the same visual header more than once when
+                # overlapping windows describe it.
+                if not headers or abs(
+                    header["top"] - headers[-1]["top"]
+                ) > self.line_tolerance:
+                    headers.append(header)
+
+                break
+
+        return headers
+
+    def _line_to_capital_one_modern_cells(
+        self,
+        line: dict,
+        header: dict,
+    ) -> dict[str, str]:
+        cells = {
+            "trans": [],
+            "post": [],
+            "description": [],
+            "amount": [],
+        }
+
+        for word in line["words"]:
+            text = str(word[4])
+            if text == "Ý":
+                continue
+
+            x_center = self._word_center_x(word)
+
+            if x_center < header["post"]:
+                cells["trans"].append(text)
+            elif x_center < header["description"]:
+                cells["post"].append(text)
+            elif x_center < header["amount"]:
+                cells["description"].append(text)
+            else:
+                cells["amount"].append(text)
+
+        return {
+            key: self._normalize_text(" ".join(parts))
+            for key, parts in cells.items()
+        }
+
+    @staticmethod
+    def _normalize_capital_one_date(value: str) -> str | None:
+        candidate = " ".join(
+            value.replace(",", " ").split()
+        )
+
+        match = re.fullmatch(
+            r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+            r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
+            r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|"
+            r"Dec(?:ember)?)\s+(\d{1,2})",
+            candidate,
+            re.IGNORECASE,
+        )
+        if match is None:
+            return None
+
+        day = int(match.group(2))
+        if not 1 <= day <= 31:
+            return None
+
+        month = match.group(1)[:3].title()
+        return f"{month} {day}"
+
+    @staticmethod
+    def _normalize_capital_one_amount(value: str) -> str | None:
+        candidate = "".join(value.split()).rstrip("*")
+        if not candidate:
+            return None
+
+        negative = False
+
+        if candidate.startswith("(") and candidate.endswith(")"):
+            negative = True
+            candidate = candidate[1:-1]
+
+        if candidate.upper().endswith("CR"):
+            negative = True
+            candidate = candidate[:-2]
+
+        if candidate.endswith("-"):
+            negative = True
+            candidate = candidate[:-1]
+
+        if candidate.startswith("-"):
+            negative = True
+            candidate = candidate[1:]
+        elif candidate.startswith("+"):
+            candidate = candidate[1:]
+
+        candidate = candidate.replace("$", "")
+
+        if not re.fullmatch(
+            r"\d[\d,]*\.\d{2}",
+            candidate,
+        ):
+            return None
+
+        candidate = candidate.replace(",", "")
+
+        return f"-{candidate}" if negative else candidate
+
+
+    @staticmethod
+    def _parse_capital_one_legacy_date_tokens(
+        first_day: str,
+        joined_token: str,
+        second_month: str,
+    ) -> tuple[str, str] | None:
+        """
+        Reconstruct the two dates used by the legacy Capital One layout.
+
+        PyMuPDF joins the first date's month and the second date's day
+        into one word, producing a visual sequence similar to:
+
+            DAY | MONTH+DAY | MONTH
+
+        Example structure only:
+            02 | MAR03 | MAR
+        """
+        first_day = first_day.strip()
+        joined_token = joined_token.strip()
+        second_month = second_month.strip()
+
+        if not re.fullmatch(r"\d{1,2}", first_day):
+            return None
+
+        joined_match = re.fullmatch(
+            r"([A-Za-z]{3})[^A-Za-z0-9]*(\d{1,2})",
+            joined_token,
+        )
+        if joined_match is None:
+            return None
+
+        if not re.fullmatch(r"[A-Za-z]{3}", second_month):
+            return None
+
+        first_month = joined_match.group(1)
+        second_day = joined_match.group(2)
+
+        first_date = VisaPDFProcessor._normalize_capital_one_date(
+            f"{first_month} {first_day}"
+        )
+        posting_date = VisaPDFProcessor._normalize_capital_one_date(
+            f"{second_month} {second_day}"
+        )
+
+        if first_date is None or posting_date is None:
+            return None
+
+        return first_date, posting_date
+
+    def _extract_capital_one_legacy_page_transactions(
+        self,
+        page: fitz.Page,
+    ) -> list[dict[str, str]]:
+        """Extract Capital One's legacy 2020 / early-2021 transaction layout."""
+        lines = self._group_words_into_lines(page.get_text("words"))
+        rows: list[dict[str, str]] = []
+
+        for line in lines:
+            words = line["words"]
+
+            if len(words) < 4:
+                continue
+
+            # The legacy transaction rows occupy the left side of the page:
+            #
+            #   first day      x ~ 40-45
+            #   month+day      x ~ 55-65
+            #   second month   x ~ 75-85
+            #   description    begins after the date fields
+            #   amount         x ~ 265-285
+            #
+            # Use word centres rather than raw x0 values because the token
+            # widths vary slightly between statements.
+            positioned = [
+                (
+                    self._word_center_x(word),
+                    str(word[4]).strip(),
+                    word,
+                )
+                for word in words
+                if str(word[4]).strip()
+            ]
+
+            first_day_candidates = [
+                (x, value, word)
+                for x, value, word in positioned
+                if 30 <= x <= 55
+                and re.fullmatch(r"\d{1,2}", value)
+            ]
+
+            joined_date_candidates = [
+                (x, value, word)
+                for x, value, word in positioned
+                if 45 <= x <= 75
+                and re.fullmatch(
+                    r"[A-Za-z]{3}[^A-Za-z0-9]*\d{1,2}",
+                    value,
+                )
+            ]
+
+            second_month_candidates = [
+                (x, value, word)
+                for x, value, word in positioned
+                if 65 <= x <= 100
+                and re.fullmatch(r"[A-Za-z]{3}", value)
+            ]
+
+            if not all(
+                (
+                    first_day_candidates,
+                    joined_date_candidates,
+                    second_month_candidates,
+                )
+            ):
+                continue
+
+            first_day_x, first_day, first_day_word = (
+                first_day_candidates[0]
+            )
+            joined_x, joined_date, joined_word = (
+                joined_date_candidates[0]
+            )
+            second_month_x, second_month, second_month_word = (
+                second_month_candidates[0]
+            )
+
+            if not (
+                first_day_x
+                < joined_x
+                < second_month_x
+            ):
+                continue
+
+            dates = self._parse_capital_one_legacy_date_tokens(
+                first_day,
+                joined_date,
+                second_month,
+            )
+            if dates is None:
+                continue
+
+            transaction_date, posting_date = dates
+
+            amount_candidates: list[
+                tuple[float, str, tuple]
+            ] = []
+
+            for x, value, word in positioned:
+                if not 240 <= x <= 315:
+                    continue
+
+                normalized = self._normalize_capital_one_amount(value)
+                if normalized is None:
+                    continue
+
+                amount_candidates.append((x, normalized, word))
+
+            if not amount_candidates:
+                continue
+
+            amount_x, amount, amount_word = amount_candidates[-1]
+
+            # Description starts after the second date token and stops before
+            # the amount. Do not use anything from the right-side statement
+            # panels that can occur on the same visual line.
+            description_parts = [
+                str(word[4])
+                for word in words
+                if word[0] > second_month_word[2]
+                and word[2] < amount_word[0]
+            ]
+
+            description = self._normalize_text(
+                " ".join(description_parts)
+            )
+
+            if not description:
+                continue
+
+            rows.append(
+                {
+                    "Transaction date": transaction_date,
+                    "Posting date": posting_date,
+                    "Description": description,
+                    "Amount": amount,
+                }
+            )
+
+        return rows
+
+    def _extract_capital_one_page_transactions(
+        self,
+        page: fitz.Page,
+    ) -> list[dict[str, str]]:
+        """Extract the modern Capital One transaction layout."""
+        headers = self._find_capital_one_modern_headers(page)
+
+        if not headers:
+            return self._extract_capital_one_legacy_page_transactions(
+                page
+            )
+
+        lines = self._group_words_into_lines(page.get_text("words"))
+        rows: list[dict[str, str]] = []
+
+        for index, header in enumerate(headers):
+            section_end = (
+                headers[index + 1]["top"]
+                if index + 1 < len(headers)
+                else float("inf")
+            )
+
+            current_row: dict[str, str] | None = None
+            last_row_y: float | None = None
+
+            for line in lines:
+                y_center = line["y_center"]
+
+                if y_center <= header["bottom"] + 1:
+                    continue
+
+                if y_center >= section_end - 1:
+                    break
+
+                cells = self._line_to_capital_one_modern_cells(
+                    line,
+                    header,
+                )
+
+                if not any(cells.values()):
+                    continue
+
+                transaction_date = self._normalize_capital_one_date(
+                    cells["trans"]
+                )
+                posting_date = self._normalize_capital_one_date(
+                    cells["post"]
+                )
+                amount = self._normalize_capital_one_amount(
+                    cells["amount"]
+                )
+
+                is_transaction = bool(
+                    transaction_date
+                    and posting_date
+                    and cells["description"]
+                    and amount is not None
+                )
+
+                if is_transaction:
+                    current_row = {
+                        "Transaction date": transaction_date,
+                        "Posting date": posting_date,
+                        "Description": cells["description"],
+                        "Amount": amount,
+                    }
+                    rows.append(current_row)
+                    last_row_y = y_center
+                    continue
+
+                if current_row is None or last_row_y is None:
+                    continue
+
+                if y_center - last_row_y > self.continuation_gap:
+                    continue
+
+                is_continuation = bool(
+                    not cells["trans"]
+                    and not cells["post"]
+                    and not cells["amount"]
+                    and cells["description"]
+                )
+                if not is_continuation:
+                    continue
+
+                current_row["Description"] = self._normalize_text(
+                    current_row["Description"]
+                    + " "
+                    + cells["description"]
+                )
+                last_row_y = y_center
 
         return rows
 
@@ -2264,6 +2769,9 @@ class VisaPDFProcessor:
         rbc_previous_balance: Decimal | None = None
         rbc_total_balance: Decimal | None = None
 
+        capital_one_previous_balance: Decimal | None = None
+        capital_one_new_balance: Decimal | None = None
+
         rbc_chq_opening_balance: Decimal | None = None
         rbc_chq_total_deposits: Decimal | None = None
         rbc_chq_total_withdrawals: Decimal | None = None
@@ -2290,6 +2798,29 @@ class VisaPDFProcessor:
                         page_rows = self._extract_cibc_page_transactions(page)
                     elif self.profile.parser == "triangle_mastercard":
                         page_rows = self._extract_triangle_page_transactions(page)
+                    elif self.profile.parser == "capital_one_mastercard":
+                        (
+                            page_previous_balance,
+                            page_new_balance,
+                        ) = self._extract_capital_one_statement_balances(
+                            page
+                        )
+
+                        if page_previous_balance is not None:
+                            capital_one_previous_balance = (
+                                page_previous_balance
+                            )
+
+                        if page_new_balance is not None:
+                            capital_one_new_balance = (
+                                page_new_balance
+                            )
+
+                        page_rows = (
+                            self._extract_capital_one_page_transactions(
+                                page
+                            )
+                        )
                     elif self.profile.parser == "simplii_chequing_account":
                         total_out_match = SIMPLII_TOTAL_OUT_RE.search(page_text)
                         total_in_match = SIMPLII_TOTAL_IN_RE.search(page_text)
@@ -2408,12 +2939,31 @@ class VisaPDFProcessor:
                     "page may be image-only or otherwise unreadable."
                 )
 
+            if (
+                self.profile.parser == "capital_one_mastercard"
+                and self._is_capital_one_zero_activity_statement(source_path)
+            ):
+                return ExtractionResult(
+                    transactions=pd.DataFrame(
+                        columns=self.required_headers
+                    ),
+                    source_pages=tuple(),
+                    ghostscript_path=ghostscript_path,
+                )
+
             raise PDFProcessingError(
                 f"The PDF contains readable text, but no transaction table matching "
                 f"profile '{self.profile.display_name}' was found."
             )
 
         transactions = pd.DataFrame(all_rows, columns=self.required_headers)
+
+        if self.profile.parser == "capital_one_mastercard":
+            self._validate_capital_one_balance(
+                transactions,
+                capital_one_previous_balance,
+                capital_one_new_balance,
+            )
 
         if self.profile.parser == "simplii_chequing_account":
             self._validate_simplii_totals(
@@ -2457,6 +3007,387 @@ class VisaPDFProcessor:
             source_pages=tuple(source_pages),
             ghostscript_path=ghostscript_path,
         )
+
+    def _capital_one_summary_amount(
+        self,
+        line: dict,
+        *,
+        minimum_x: float,
+    ) -> Decimal | None:
+        """Return the right-most Capital One monetary value on a line."""
+        candidates: list[tuple[float, Decimal]] = []
+
+        for word in line["words"]:
+            x_center = self._word_center_x(word)
+
+            if x_center < minimum_x:
+                continue
+
+            normalized = self._normalize_capital_one_amount(
+                str(word[4])
+            )
+
+            if normalized is None:
+                continue
+
+            candidates.append(
+                (
+                    x_center,
+                    Decimal(normalized),
+                )
+            )
+
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda item: item[0],
+        )[1]
+
+    def _extract_capital_one_modern_balances(
+        self,
+        page: fitz.Page,
+    ) -> tuple[Decimal | None, Decimal | None]:
+        """
+        Extract Previous Balance and New Balance from the modern
+        right-hand Account Activity summary.
+        """
+        lines = self._group_words_into_lines(
+            page.get_text("words")
+        )
+
+        sequence = (
+            "previous",
+            "payments",
+            "credits",
+            "transactions",
+            "fees",
+            "interest",
+            "new",
+        )
+
+        values: dict[str, Decimal] = {}
+        state = 0
+
+        for line in lines:
+            tokens = [
+                re.sub(
+                    r"[^A-Za-z]",
+                    "",
+                    str(word[4]),
+                ).lower()
+                for word in line["words"]
+                if self._word_center_x(word) >= 320
+            ]
+
+            tokens = [
+                token
+                for token in tokens
+                if token
+            ]
+
+            if not tokens:
+                continue
+
+            amount = self._capital_one_summary_amount(
+                line,
+                minimum_x=525,
+            )
+
+            if amount is None:
+                continue
+
+            expected = sequence[state]
+
+            if expected == "previous":
+                matched = (
+                    "previous" in tokens
+                    and "balance" in tokens
+                )
+            elif expected == "new":
+                matched = (
+                    "new" in tokens
+                    and "balance" in tokens
+                )
+            else:
+                matched = expected in tokens
+
+            if not matched:
+                continue
+
+            values[expected] = amount
+            state += 1
+
+            if state == len(sequence):
+                return (
+                    values["previous"],
+                    values["new"],
+                )
+
+        return None, None
+
+    def _extract_capital_one_legacy_balances(
+        self,
+        page: fitz.Page,
+    ) -> tuple[Decimal | None, Decimal | None]:
+        """
+        Extract Previous Balance and New Balance from the legacy
+        horizontal account-summary block.
+        """
+        lines = self._group_words_into_lines(
+            page.get_text("words")
+        )
+
+        candidates: list[
+            tuple[int, float, Decimal, Decimal]
+        ] = []
+
+        for start in range(len(lines)):
+            for size in range(1, 4):
+                window = lines[start : start + size]
+
+                if len(window) != size:
+                    continue
+
+                if (
+                    window[-1]["y_center"]
+                    - window[0]["y_center"]
+                    > 30
+                ):
+                    continue
+
+                header_text = self._normalize_text(
+                    " ".join(
+                        str(word[4])
+                        for candidate_line in window
+                        for word in candidate_line["words"]
+                    )
+                ).lower()
+
+                if not (
+                    "previous balance" in header_text
+                    and "payments" in header_text
+                    and "credits" in header_text
+                    and "transactions" in header_text
+                    and "new balance" in header_text
+                ):
+                    continue
+
+                header_bottom = max(
+                    word[3]
+                    for candidate_line in window
+                    for word in candidate_line["words"]
+                )
+
+                best_amounts: list[
+                    tuple[float, Decimal]
+                ] = []
+
+                for candidate_line in lines:
+                    if (
+                        candidate_line["y_center"]
+                        <= header_bottom
+                    ):
+                        continue
+
+                    if (
+                        candidate_line["y_center"]
+                        - header_bottom
+                        > 50
+                    ):
+                        break
+
+                    amounts: list[
+                        tuple[float, Decimal]
+                    ] = []
+
+                    for word in candidate_line["words"]:
+                        normalized = (
+                            self._normalize_capital_one_amount(
+                                str(word[4])
+                            )
+                        )
+
+                        if normalized is None:
+                            continue
+
+                        amounts.append(
+                            (
+                                self._word_center_x(word),
+                                Decimal(normalized),
+                            )
+                        )
+
+                    if len(amounts) > len(best_amounts):
+                        best_amounts = amounts
+
+                if len(best_amounts) < 5:
+                    continue
+
+                best_amounts.sort(
+                    key=lambda item: item[0]
+                )
+
+                candidates.append(
+                    (
+                        len(best_amounts),
+                        window[0]["y_center"],
+                        best_amounts[0][1],
+                        best_amounts[-1][1],
+                    )
+                )
+
+        if not candidates:
+            return None, None
+
+        candidates.sort(
+            key=lambda item: (
+                -item[0],
+                item[1],
+            )
+        )
+
+        _, _, previous_balance, new_balance = (
+            candidates[0]
+        )
+
+        return previous_balance, new_balance
+
+    def _extract_capital_one_statement_balances(
+        self,
+        page: fitz.Page,
+    ) -> tuple[Decimal | None, Decimal | None]:
+        """Extract Capital One balances from either known statement era."""
+        previous, new = (
+            self._extract_capital_one_modern_balances(page)
+        )
+
+        if (
+            previous is not None
+            and new is not None
+        ):
+            return previous, new
+
+        return self._extract_capital_one_legacy_balances(
+            page
+        )
+
+    def _validate_capital_one_balance(
+        self,
+        transactions: pd.DataFrame,
+        previous_balance: Decimal | None,
+        new_balance: Decimal | None,
+    ) -> None:
+        """
+        Require extracted Capital One activity to reconcile the
+        statement's Previous Balance to its New Balance.
+        """
+        if (
+            previous_balance is None
+            or new_balance is None
+        ):
+            raise PDFProcessingError(
+                "Capital One statement balances were not found. "
+                "Extraction was not accepted because completeness "
+                "could not be verified."
+            )
+
+        extracted_activity = sum(
+            (
+                Decimal(str(value))
+                for value in transactions["Amount"]
+            ),
+            Decimal("0.00"),
+        )
+
+        if (
+            previous_balance + extracted_activity
+            != new_balance
+        ):
+            raise PDFProcessingError(
+                "Capital One extraction does not reconcile to the "
+                "statement balance. The PDF may contain an unreadable "
+                "or missed transaction row."
+            )
+
+    def _is_capital_one_zero_activity_statement(
+        self,
+        pdf_path: str | Path,
+    ) -> bool:
+        """
+        Return True only when a Capital One statement explicitly verifies
+        zero financial activity in its statement summary.
+
+        This is intentionally narrow. A readable statement with no extracted
+        rows is still treated as an extraction failure unless the Capital One
+        summary itself shows the relevant activity categories as zero.
+        """
+        if self.profile.parser != "capital_one_mastercard":
+            return False
+
+        required_phrases = (
+            "previous balance",
+            "payments and credits",
+            "transactions",
+            "interest charges",
+            "new balance",
+        )
+
+        with fitz.open(pdf_path) as document:
+            for page in document:
+                lines = self._group_words_into_lines(
+                    page.get_text("words")
+                )
+
+                for index, line in enumerate(lines):
+                    line_text = self._normalize_text(
+                        " ".join(
+                            str(word[4])
+                            for word in line["words"]
+                        )
+                    ).lower()
+
+                    if not all(
+                        phrase in line_text
+                        for phrase in required_phrases
+                    ):
+                        continue
+
+                    base_y = line["y_center"]
+                    amounts: list[Decimal] = []
+
+                    for candidate in lines[index : index + 4]:
+                        if candidate["y_center"] - base_y > 35:
+                            break
+
+                        for word in candidate["words"]:
+                            raw = str(word[4]).strip()
+
+                            if not AMOUNT_RE.fullmatch(raw):
+                                continue
+
+                            try:
+                                amounts.append(
+                                    self._parse_amount(raw)
+                                )
+                            except (InvalidOperation, ValueError):
+                                continue
+
+                    # The legacy Capital One account summary contains multiple
+                    # financial totals. Requiring at least five parsed amounts
+                    # and requiring every one to be zero prevents a generic
+                    # "no rows" result from being accepted as an empty statement.
+                    if (
+                        len(amounts) >= 5
+                        and all(
+                            amount == Decimal("0.00")
+                            for amount in amounts
+                        )
+                    ):
+                        return True
+
+        return False
 
     def save_transactions(
         self,
