@@ -1,0 +1,24 @@
+{
+  "profile_id": "rbc_loc_v1",
+  "display_name": "RBC Royal Credit Line",
+  "profile_version": 1,
+  "institution": "RBC Royal Bank",
+  "document_type": "line_of_credit_statement",
+  "parser": "rbc_loc",
+  "input_folder": "editable_input/rbc_loc",
+  "output_folder": "csv_output/rbc_loc",
+  "file_pattern": "*.pdf",
+  "recursive": true,
+  "preserve_subfolders": true,
+  "required_headers": [
+    "Date",
+    "Description",
+    "Interest/Fees/Insurance ($)",
+    "Withdrawals ($)",
+    "Payments ($)",
+    "Balance owing ($)"
+  ],
+  "excluded_page_phrases": [],
+  "line_tolerance": 2.5,
+  "continuation_gap": 18.0
+}

@@ -88,12 +88,49 @@ TD_NEW_BALANCE_RE = re.compile(
     r"total\s+new\s+balance\s+\$?([\d,]+\.\d{2})",
     re.IGNORECASE,
 )
+
+RBC_LOC_PRINCIPAL_BALANCE_RE = re.compile(
+    r"Principal\s+balance\s+on\s+"
+    r"[A-Za-z]+\s+\d{1,2},\s+\d{4}\s+"
+    r"\$?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+
+RBC_LOC_WITHDRAWALS_RE = re.compile(
+    r"Sum\s+of\s+withdrawals\s+including\s+adjustments\s+"
+    r"on\s+your\s+account\s+"
+    r"-?\s*\$?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+
+RBC_LOC_PAYMENTS_RE = re.compile(
+    r"Sum\s+of\s+payments\s+including\s+adjustments\s+"
+    r"on\s+your\s+account\s+"
+    r"\$?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+
+RBC_LOC_INTEREST_RE = re.compile(
+    r"Total\s+interest\s+costs\s+including\s+adjustments\s+"
+    r"on\s+your\s+account\s+"
+    r"\$?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+
+RBC_LOC_FEES_RE = re.compile(
+    r"Total\s+fees\s+including\s+adjustments\s+"
+    r"on\s+your\s+account\s+"
+    r"\$?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+
 SUPPORTED_PARSERS = {
     "cibc_credit_card",
     "simplii_chequing_account",
     "td_visa_credit_card",
     "rbc_visa_credit_card",
     "rbc_chequing_account",
+    "rbc_loc",
 }
 
 
@@ -1520,6 +1557,379 @@ class VisaPDFProcessor:
                 f"${closing_balance:,.2f}."
             )
 
+    # RBC LOC parser ---------------------------------------------------------
+
+    def _find_rbc_loc_header(self, page: fitz.Page) -> dict | None:
+        """Locate the RBC Royal Credit Line activity columns."""
+        lines = self._group_words_into_lines(page.get_text("words"))
+
+        for line in lines:
+            words = line["words"]
+
+            def find_word(predicate):
+                return next(
+                    (
+                        word
+                        for word in words
+                        if predicate(str(word[4]).lower())
+                    ),
+                    None,
+                )
+
+            date = find_word(lambda value: value == "date")
+            description = find_word(lambda value: value == "description")
+            interest = find_word(
+                lambda value: value.startswith("interest/fees/insurance")
+            )
+            withdrawals = find_word(lambda value: value == "withdrawals")
+            payments = find_word(lambda value: value == "payments")
+            balance = find_word(lambda value: value == "balance")
+
+            if not all(
+                (
+                    date,
+                    description,
+                    interest,
+                    withdrawals,
+                    payments,
+                    balance,
+                )
+            ):
+                continue
+
+            positions = [
+                date[0],
+                description[0],
+                interest[0],
+                withdrawals[0],
+                payments[0],
+                balance[0],
+            ]
+
+            if positions != sorted(positions):
+                continue
+
+            return {
+                "date": date[0],
+                "description": description[0],
+                "interest": interest[0],
+                "withdrawals": withdrawals[0],
+                "payments": payments[0],
+                "balance": balance[0],
+                "bottom": max(word[3] for word in words),
+            }
+
+        return None
+
+    def _line_to_rbc_loc_cells(
+        self,
+        line: dict,
+        header: dict,
+    ) -> dict[str, str]:
+        cells = {
+            "date": [],
+            "description": [],
+            "interest": [],
+            "withdrawals": [],
+            "payments": [],
+            "balance": [],
+        }
+
+        for word in line["words"]:
+            value = str(word[4])
+            x_center = self._word_center_x(word)
+
+            if x_center < header["date"]:
+                continue
+
+            if x_center < header["description"]:
+                cells["date"].append(value)
+            elif x_center < header["interest"]:
+                cells["description"].append(value)
+            elif x_center < header["withdrawals"]:
+                cells["interest"].append(value)
+            elif x_center < header["payments"]:
+                cells["withdrawals"].append(value)
+            elif x_center < header["balance"]:
+                cells["payments"].append(value)
+            else:
+                cells["balance"].append(value)
+
+        return {
+            key: self._normalize_text(" ".join(parts))
+            for key, parts in cells.items()
+        }
+
+    def _extract_rbc_loc_page_transactions(
+        self,
+        page: fitz.Page,
+        current_date: str | None,
+        pending_description: str,
+    ) -> tuple[list[dict[str, str]], str | None, str]:
+        """Extract RBC LOC transactions while retaining state across pages."""
+        page_text = page.get_text("text")
+
+        if self._page_is_excluded(page_text):
+            return [], current_date, pending_description
+
+        header = self._find_rbc_loc_header(page)
+        if header is None:
+            return [], current_date, pending_description
+
+        words = [
+            word
+            for word in page.get_text("words")
+            if word[1] >= header["bottom"] - 1
+        ]
+
+        lines = self._group_words_into_lines(words)
+        rows: list[dict[str, str]] = []
+
+        for line in lines:
+            if line["y_center"] <= header["bottom"] + 1:
+                continue
+
+            cells = self._line_to_rbc_loc_cells(line, header)
+
+            joined = self._normalize_text(
+                " ".join(value for value in cells.values() if value)
+            )
+            lowered = joined.lower()
+
+            if not joined:
+                continue
+
+            # Material following the account-activity table.
+            if (
+                lowered.startswith("this is a history of your interest")
+                or lowered.startswith("please note the interest payment")
+                or lowered.startswith("what is my minimum payment")
+                or lowered.startswith("please retain this statement")
+            ):
+                pending_description = ""
+                break
+
+            # Do not create transactions from balance labels.
+            if (
+                "opening balance" in lowered
+                or "closing balance" in lowered
+                or lowered.startswith("principal balance")
+            ):
+                pending_description = ""
+                continue
+
+            date_match = RBC_CHQ_DATE_RE.fullmatch(cells["date"])
+
+            if cells["date"] and date_match is None:
+                continue
+
+            if date_match is not None:
+                current_date = self._normalize_rbc_chequing_date(
+                    date_match.group(1),
+                    date_match.group(2),
+                )
+
+            interest_valid = bool(
+                AMOUNT_RE.fullmatch(cells["interest"])
+            )
+            withdrawal_valid = bool(
+                AMOUNT_RE.fullmatch(cells["withdrawals"])
+            )
+            payment_valid = bool(
+                AMOUNT_RE.fullmatch(cells["payments"])
+            )
+
+            has_transaction_amount = (
+                interest_valid
+                or withdrawal_valid
+                or payment_valid
+            )
+
+            description = cells["description"]
+
+            if not has_transaction_amount:
+                if description:
+                    pending_description = self._normalize_text(
+                        f"{pending_description} {description}"
+                    )
+                continue
+
+            if current_date is None:
+                raise PDFProcessingError(
+                    "RBC LOC transaction found before a date was established."
+                )
+
+            full_description = self._normalize_text(
+                f"{pending_description} {description}"
+            )
+
+            if not full_description:
+                raise PDFProcessingError(
+                    "RBC LOC transaction amount found without a description."
+                )
+
+            def clean_amount(value: str, valid: bool) -> str:
+                if not valid:
+                    return ""
+                return value.replace("$", "").rstrip("*")
+
+            rows.append(
+                {
+                    "Date": current_date,
+                    "Description": full_description,
+                    "Interest/Fees/Insurance ($)": clean_amount(
+                        cells["interest"],
+                        interest_valid,
+                    ),
+                    "Withdrawals ($)": clean_amount(
+                        cells["withdrawals"],
+                        withdrawal_valid,
+                    ),
+                    "Payments ($)": clean_amount(
+                        cells["payments"],
+                        payment_valid,
+                    ),
+                    "Balance owing ($)": clean_amount(
+                        cells["balance"],
+                        bool(AMOUNT_RE.fullmatch(cells["balance"])),
+                    ),
+                }
+            )
+
+            pending_description = ""
+
+        return rows, current_date, pending_description
+
+    def _extract_rbc_loc_summary(
+        self,
+        page_text: str,
+    ) -> tuple[
+        Decimal | None,
+        Decimal | None,
+        Decimal | None,
+        Decimal | None,
+        Decimal | None,
+        Decimal | None,
+    ]:
+        """Extract RBC LOC principal and statement totals."""
+        normalized = self._normalize_text(page_text)
+
+        balances = [
+            self._parse_amount(value)
+            for value in RBC_LOC_PRINCIPAL_BALANCE_RE.findall(normalized)
+        ]
+
+        opening_balance = balances[0] if balances else None
+        closing_balance = balances[-1] if len(balances) >= 2 else None
+
+        def get_amount(pattern: re.Pattern[str]) -> Decimal | None:
+            match = pattern.search(normalized)
+            if match is None:
+                return None
+            return self._parse_amount(match.group(1))
+
+        return (
+            opening_balance,
+            get_amount(RBC_LOC_WITHDRAWALS_RE),
+            get_amount(RBC_LOC_PAYMENTS_RE),
+            get_amount(RBC_LOC_INTEREST_RE),
+            get_amount(RBC_LOC_FEES_RE),
+            closing_balance,
+        )
+
+    def _validate_rbc_loc_totals(
+        self,
+        transactions: pd.DataFrame,
+        opening_balance: Decimal | None,
+        statement_withdrawals: Decimal | None,
+        statement_payments: Decimal | None,
+        statement_interest: Decimal | None,
+        statement_fees: Decimal | None,
+        closing_balance: Decimal | None,
+    ) -> None:
+        """Verify RBC LOC extraction against the statement summary."""
+        values = (
+            opening_balance,
+            statement_withdrawals,
+            statement_payments,
+            statement_interest,
+            statement_fees,
+            closing_balance,
+        )
+
+        if any(value is None for value in values):
+            raise PDFProcessingError(
+                "RBC LOC statement totals were not found. Extraction was not "
+                "accepted because completeness could not be verified."
+            )
+
+        extracted_withdrawals = sum(
+            (
+                self._parse_amount(value)
+                for value in transactions["Withdrawals ($)"]
+                if value
+            ),
+            Decimal("0.00"),
+        )
+
+        extracted_principal_payments = sum(
+            (
+                self._parse_amount(value)
+                for value in transactions["Payments ($)"]
+                if value
+            ),
+            Decimal("0.00"),
+        )
+
+        extracted_interest_fees = sum(
+            (
+                self._parse_amount(value)
+                for value in transactions["Interest/Fees/Insurance ($)"]
+                if value
+            ),
+            Decimal("0.00"),
+        )
+
+        if extracted_withdrawals != statement_withdrawals:
+            raise PDFProcessingError(
+                "RBC LOC extracted withdrawals do not match the statement. "
+                f"Extracted: ${extracted_withdrawals:,.2f}; statement: "
+                f"${statement_withdrawals:,.2f}."
+            )
+
+        extracted_total_payments = (
+            extracted_principal_payments
+            + extracted_interest_fees
+        )
+
+        if extracted_total_payments != statement_payments:
+            raise PDFProcessingError(
+                "RBC LOC extracted payments do not match the statement. "
+                f"Principal payments: ${extracted_principal_payments:,.2f}; "
+                f"interest/fees/insurance: ${extracted_interest_fees:,.2f}; "
+                f"combined: ${extracted_total_payments:,.2f}; statement: "
+                f"${statement_payments:,.2f}."
+            )
+
+        calculated_closing = (
+            opening_balance
+            + statement_withdrawals
+            + statement_interest
+            + statement_fees
+            - statement_payments
+        )
+
+        if calculated_closing != closing_balance:
+            raise PDFProcessingError(
+                "RBC LOC principal balance does not reconcile. "
+                f"Opening: ${opening_balance:,.2f}; withdrawals: "
+                f"${statement_withdrawals:,.2f}; interest: "
+                f"${statement_interest:,.2f}; fees: ${statement_fees:,.2f}; "
+                f"payments: ${statement_payments:,.2f}; calculated closing: "
+                f"${calculated_closing:,.2f}; statement closing: "
+                f"${closing_balance:,.2f}."
+            )
+
     # Shared processing -------------------------------------------------------
 
     def extract_transactions(self, pdf_path: str | Path) -> ExtractionResult:
@@ -1552,6 +1962,15 @@ class VisaPDFProcessor:
         rbc_chq_closing_balance: Decimal | None = None
         rbc_chq_current_date: str | None = None
         rbc_chq_pending_description = ""
+
+        rbc_loc_opening_balance: Decimal | None = None
+        rbc_loc_total_withdrawals: Decimal | None = None
+        rbc_loc_total_payments: Decimal | None = None
+        rbc_loc_total_interest: Decimal | None = None
+        rbc_loc_total_fees: Decimal | None = None
+        rbc_loc_closing_balance: Decimal | None = None
+        rbc_loc_current_date: str | None = None
+        rbc_loc_pending_description = ""
 
         try:
             with fitz.open(source_path) as document:
@@ -1614,6 +2033,38 @@ class VisaPDFProcessor:
                             page,
                             rbc_chq_current_date,
                             rbc_chq_pending_description,
+                        )
+                    elif self.profile.parser == "rbc_loc":
+                        (
+                            page_opening,
+                            page_withdrawals,
+                            page_payments,
+                            page_interest,
+                            page_fees,
+                            page_closing,
+                        ) = self._extract_rbc_loc_summary(page_text)
+
+                        if page_opening is not None:
+                            rbc_loc_opening_balance = page_opening
+                        if page_withdrawals is not None:
+                            rbc_loc_total_withdrawals = page_withdrawals
+                        if page_payments is not None:
+                            rbc_loc_total_payments = page_payments
+                        if page_interest is not None:
+                            rbc_loc_total_interest = page_interest
+                        if page_fees is not None:
+                            rbc_loc_total_fees = page_fees
+                        if page_closing is not None:
+                            rbc_loc_closing_balance = page_closing
+
+                        (
+                            page_rows,
+                            rbc_loc_current_date,
+                            rbc_loc_pending_description,
+                        ) = self._extract_rbc_loc_page_transactions(
+                            page,
+                            rbc_loc_current_date,
+                            rbc_loc_pending_description,
                         )
                     else:
                         raise PDFProcessingError(
@@ -1680,6 +2131,16 @@ class VisaPDFProcessor:
                 rbc_chq_total_withdrawals,
                 rbc_chq_closing_balance,
             )
+        elif self.profile.parser == "rbc_loc":
+            self._validate_rbc_loc_totals(
+                transactions,
+                rbc_loc_opening_balance,
+                rbc_loc_total_withdrawals,
+                rbc_loc_total_payments,
+                rbc_loc_total_interest,
+                rbc_loc_total_fees,
+                rbc_loc_closing_balance,
+            )
 
         return ExtractionResult(
             transactions=transactions,
@@ -1713,6 +2174,28 @@ class VisaPDFProcessor:
         result = self.extract_transactions(pdf_path)
         csv_path = self.save_transactions(pdf_path, output_folder, result)
         return result, csv_path
+
+    def _is_rbc_loc_annual_summary(
+        self,
+        pdf_path: str | Path,
+    ) -> bool:
+        """Return True for RBC LOC annual summaries without transaction tables."""
+        if self.profile.parser != "rbc_loc":
+            return False
+
+        with fitz.open(pdf_path) as document:
+            text = self._normalize_text(
+                " ".join(page.get_text("text") for page in document)
+            )
+
+        lowered = text.lower()
+
+        return (
+            "year opening principal balance" in lowered
+            and "year closing principal balance" in lowered
+            and "interest paid" in lowered
+            and "details of your account activity" not in lowered
+        )
 
     def _find_pdf_files(self, source_folder: Path) -> list[Path]:
         iterator = (
@@ -1756,6 +2239,19 @@ class VisaPDFProcessor:
         file_results: list[BatchFileResult] = []
 
         for pdf_file in pdf_files:
+            if self._is_rbc_loc_annual_summary(pdf_file):
+                file_results.append(
+                    BatchFileResult(
+                        pdf_file=pdf_file,
+                        status="Skipped",
+                        transaction_count=0,
+                        source_pages=(),
+                        output_csv=None,
+                        error="Annual RBC LOC summary; no transaction table.",
+                    )
+                )
+                continue
+
             file_destination = destination
             if self.profile.preserve_subfolders:
                 file_destination = destination / pdf_file.parent.relative_to(source_folder)
