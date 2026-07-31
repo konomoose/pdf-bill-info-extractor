@@ -1,0 +1,22 @@
+{
+  "profile_id": "triangle_mastercard_v1",
+  "display_name": "Triangle Mastercard",
+  "profile_version": 1,
+  "institution": "Canadian Tire Bank",
+  "document_type": "credit_card_statement",
+  "parser": "triangle_mastercard",
+  "input_folder": "editable_input/triangle_mastercard",
+  "output_folder": "csv_output/triangle_mastercard",
+  "file_pattern": "*.pdf",
+  "recursive": true,
+  "preserve_subfolders": true,
+  "required_headers": [
+    "Transaction date",
+    "Posting date",
+    "Activity description",
+    "Amount($)"
+  ],
+  "excluded_page_phrases": [],
+  "line_tolerance": 2.5,
+  "continuation_gap": 18.0
+}

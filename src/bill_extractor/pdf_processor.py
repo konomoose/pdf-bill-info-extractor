@@ -79,6 +79,14 @@ SIMPLII_TOTAL_OUT_RE = re.compile(
 SIMPLII_TOTAL_IN_RE = re.compile(
     r"total\s+funds\s+in\s+([\d,]+\.\d{2})", re.IGNORECASE
 )
+TRIANGLE_DATE_RE = re.compile(
+    rf"^{MONTHS}\s*\d{{1,2}}$",
+    re.IGNORECASE,
+)
+TRIANGLE_AMOUNT_RE = re.compile(
+    r"^(?:-\$?\d[\d,]*\.\d{2}|\$?\d[\d,]*\.\d{2}-?)(?:\*+)?$"
+)
+
 TD_DATE_RE = re.compile(rf"^{MONTHS}\s*\d{{1,2}}$", re.IGNORECASE)
 TD_PREVIOUS_BALANCE_RE = re.compile(
     r"previous\s+statement\s+balance\s+\$?([\d,]+\.\d{2})",
@@ -131,6 +139,7 @@ SUPPORTED_PARSERS = {
     "rbc_visa_credit_card",
     "rbc_chequing_account",
     "rbc_loc",
+    "triangle_mastercard",
 }
 
 
@@ -455,6 +464,286 @@ class VisaPDFProcessor:
                 )
 
             last_row_y = y_center
+
+        return rows
+
+    # Triangle Mastercard parser ---------------------------------------------
+
+    def _find_triangle_transaction_headers(
+        self,
+        page: fitz.Page,
+    ) -> list[dict]:
+        lines = self._group_words_into_lines(page.get_text("words"))
+        headers: list[dict] = []
+
+        for index, line in enumerate(lines):
+            words = line["words"]
+
+            transaction_words = [
+                word for word in words
+                if word[4].lower() == "transaction"
+            ]
+            posting_words = [
+                word for word in words
+                if word[4].lower() == "posting"
+            ]
+
+            if not transaction_words or not posting_words:
+                continue
+
+            trans = min(transaction_words, key=lambda word: word[0])
+            post = min(posting_words, key=lambda word: word[0])
+
+            if trans[0] >= post[0]:
+                continue
+
+            for detail_index in range(
+                index + 1,
+                min(index + 3, len(lines)),
+            ):
+                detail_line = lines[detail_index]
+                detail_words = detail_line["words"]
+
+                date_words = [
+                    word for word in detail_words
+                    if word[4].lower() == "date"
+                ]
+                amount_words = [
+                    word for word in detail_words
+                    if word[4].lower() == "amount"
+                ]
+
+                if len(date_words) < 2 or not amount_words:
+                    continue
+
+                details_words = [
+                    word for word in detail_words
+                    if word[4].lower() == "details"
+                ]
+                description_words = [
+                    word for word in detail_words
+                    if word[4].lower() == "description"
+                ]
+
+                if details_words:
+                    description = min(
+                        details_words,
+                        key=lambda word: word[0],
+                    )
+                elif description_words:
+                    description_word = min(
+                        description_words,
+                        key=lambda word: word[0],
+                    )
+
+                    transaction_labels = [
+                        word for word in detail_words
+                        if (
+                            word[4].lower() == "transaction"
+                            and post[0] < word[0] < description_word[0]
+                        )
+                    ]
+
+                    description = (
+                        min(
+                            transaction_labels,
+                            key=lambda word: word[0],
+                        )
+                        if transaction_labels
+                        else description_word
+                    )
+                else:
+                    continue
+
+                amount = min(
+                    amount_words,
+                    key=lambda word: word[0],
+                )
+
+                x_positions = [
+                    trans[0],
+                    post[0],
+                    description[0],
+                    amount[0],
+                ]
+
+                if x_positions != sorted(x_positions):
+                    continue
+
+                combined_words = words + detail_words
+
+                headers.append(
+                    {
+                        "trans": trans[0],
+                        "post": post[0],
+                        "description": description[0],
+                        "amount": amount[0],
+                        "top": min(
+                            word[1] for word in combined_words
+                        ),
+                        "bottom": max(
+                            word[3] for word in combined_words
+                        ),
+                    }
+                )
+                break
+
+        return headers
+
+    def _line_to_triangle_cells(
+        self,
+        line: dict,
+        header: dict,
+    ) -> dict[str, str]:
+        cells = {
+            "trans": [],
+            "post": [],
+            "description": [],
+            "amount": [],
+        }
+
+        for word in line["words"]:
+            x_position = word[0]
+            x_end = word[2]
+            value = word[4]
+
+            if x_position < header["post"]:
+                cells["trans"].append(value)
+            elif x_position < header["description"]:
+                cells["post"].append(value)
+            elif (
+                TRIANGLE_AMOUNT_RE.fullmatch(value)
+                and x_end >= header["amount"]
+            ):
+                # Triangle amounts are right-aligned, so the left edge
+                # can begin slightly left of the Amount header label.
+                cells["amount"].append(value)
+            elif x_position < header["amount"]:
+                cells["description"].append(value)
+
+        return {
+            key: self._normalize_text(" ".join(parts))
+            for key, parts in cells.items()
+        }
+
+    @staticmethod
+    def _normalize_triangle_amount(value: str) -> str:
+        value = value.replace("$", "").rstrip("*")
+
+        if value.endswith("-"):
+            value = "-" + value[:-1]
+
+        return value
+
+    @staticmethod
+    def _normalize_triangle_date(value: str) -> str | None:
+        parts = value.split()
+
+        if len(parts) < 2:
+            return None
+
+        candidate = f"{parts[0]} {parts[1]}"
+
+        if not TRIANGLE_DATE_RE.fullmatch(candidate):
+            return None
+
+        return candidate
+
+    def _extract_triangle_page_transactions(
+        self,
+        page: fitz.Page,
+    ) -> list[dict[str, str]]:
+        headers = self._find_triangle_transaction_headers(page)
+
+        if not headers:
+            return []
+
+        lines = self._group_words_into_lines(page.get_text("words"))
+        rows: list[dict[str, str]] = []
+
+        for index, header in enumerate(headers):
+            section_end = (
+                headers[index + 1]["top"]
+                if index + 1 < len(headers)
+                else float("inf")
+            )
+
+            current_row: dict[str, str] | None = None
+            last_row_y: float | None = None
+
+            for line in lines:
+                y_center = line["y_center"]
+
+                if y_center <= header["bottom"] + 1:
+                    continue
+
+                if y_center >= section_end - 1:
+                    break
+
+                cells = self._line_to_triangle_cells(
+                    line,
+                    header,
+                )
+
+                joined_text = self._normalize_text(
+                    " ".join(cells.values())
+                )
+                lowered = joined_text.lower()
+
+                if not joined_text:
+                    continue
+
+                if lowered.startswith("total"):
+                    current_row = None
+                    last_row_y = None
+                    continue
+
+                transaction_date = self._normalize_triangle_date(
+                    cells["trans"]
+                )
+                posting_date = self._normalize_triangle_date(
+                    cells["post"]
+                )
+
+                is_transaction = bool(
+                    transaction_date
+                    and posting_date
+                    and TRIANGLE_AMOUNT_RE.fullmatch(cells["amount"])
+                )
+
+                if is_transaction:
+                    current_row = {
+                        "Transaction date": transaction_date,
+                        "Posting date": posting_date,
+                        "Activity description": cells["description"],
+                        "Amount($)": self._normalize_triangle_amount(
+                            cells["amount"]
+                        ),
+                    }
+                    rows.append(current_row)
+                    last_row_y = y_center
+                    continue
+
+                if current_row is None or last_row_y is None:
+                    continue
+
+                if y_center - last_row_y > self.continuation_gap:
+                    continue
+
+                if (
+                    not cells["trans"]
+                    and not cells["post"]
+                    and not cells["amount"]
+                    and cells["description"]
+                ):
+                    current_row["Activity description"] = (
+                        self._normalize_text(
+                            current_row["Activity description"]
+                            + " "
+                            + cells["description"]
+                        )
+                    )
+                    last_row_y = y_center
 
         return rows
 
@@ -1999,6 +2288,8 @@ class VisaPDFProcessor:
 
                     if self.profile.parser == "cibc_credit_card":
                         page_rows = self._extract_cibc_page_transactions(page)
+                    elif self.profile.parser == "triangle_mastercard":
+                        page_rows = self._extract_triangle_page_transactions(page)
                     elif self.profile.parser == "simplii_chequing_account":
                         total_out_match = SIMPLII_TOTAL_OUT_RE.search(page_text)
                         total_in_match = SIMPLII_TOTAL_IN_RE.search(page_text)
