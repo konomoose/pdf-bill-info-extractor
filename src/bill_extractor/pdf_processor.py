@@ -4,7 +4,7 @@ import logging
 import re
 import shutil
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable
@@ -79,6 +79,12 @@ SIMPLII_TOTAL_OUT_RE = re.compile(
 )
 SIMPLII_TOTAL_IN_RE = re.compile(
     r"total\s+funds\s+in\s+([\d,]+\.\d{2})", re.IGNORECASE
+)
+SIMPLII_STATEMENT_PERIOD_RE = re.compile(
+    r"statement\s+period:\s*"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s*-\s*"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
 )
 TRIANGLE_DATE_RE = re.compile(
     rf"^{MONTHS}\s*\d{{1,2}}$",
@@ -1490,6 +1496,53 @@ class VisaPDFProcessor:
 
         return rows
 
+    @staticmethod
+    def _extract_simplii_statement_period(
+        page_text: str,
+    ) -> tuple[date | None, date | None]:
+        match = SIMPLII_STATEMENT_PERIOD_RE.search(
+            page_text
+        )
+
+        if match is None:
+            return None, None
+
+        parsed_dates: list[date] = []
+
+        for value in match.groups():
+            parsed_date: date | None = None
+
+            for date_format in (
+                "%B %d, %Y",
+                "%b %d, %Y",
+            ):
+                try:
+                    parsed_date = datetime.strptime(
+                        value,
+                        date_format,
+                    ).date()
+                    break
+                except ValueError:
+                    continue
+
+            if parsed_date is None:
+                raise PDFProcessingError(
+                    "Invalid Simplii statement-period date: "
+                    f"{value!r}."
+                )
+
+            parsed_dates.append(parsed_date)
+
+        statement_start, statement_end = parsed_dates
+
+        if statement_start > statement_end:
+            raise PDFProcessingError(
+                "Simplii statement-period start date is later "
+                "than its end date."
+            )
+
+        return statement_start, statement_end
+
     def _validate_simplii_totals(
         self,
         transactions: pd.DataFrame,
@@ -2778,6 +2831,8 @@ class VisaPDFProcessor:
         total_text_characters = 0
         simplii_total_out: Decimal | None = None
         simplii_total_in: Decimal | None = None
+        simplii_statement_start: date | None = None
+        simplii_statement_end: date | None = None
         td_previous_balance: Decimal | None = None
         td_new_balance: Decimal | None = None
         rbc_previous_balance: Decimal | None = None
@@ -2836,13 +2891,59 @@ class VisaPDFProcessor:
                             )
                         )
                     elif self.profile.parser == "simplii_chequing_account":
+                        (
+                            page_statement_start,
+                            page_statement_end,
+                        ) = self._extract_simplii_statement_period(
+                            page_text
+                        )
+
+                        if (
+                            page_statement_start is not None
+                            and page_statement_end is not None
+                        ):
+                            page_period = (
+                                page_statement_start,
+                                page_statement_end,
+                            )
+
+                            if simplii_statement_start is not None:
+                                current_period = (
+                                    simplii_statement_start,
+                                    simplii_statement_end,
+                                )
+
+                                if page_period != current_period:
+                                    raise PDFProcessingError(
+                                        "Conflicting Simplii statement "
+                                        "periods were found in the PDF."
+                                    )
+
+                            simplii_statement_start = (
+                                page_statement_start
+                            )
+                            simplii_statement_end = (
+                                page_statement_end
+                            )
+
                         total_out_match = SIMPLII_TOTAL_OUT_RE.search(page_text)
                         total_in_match = SIMPLII_TOTAL_IN_RE.search(page_text)
+
                         if total_out_match:
-                            simplii_total_out = self._parse_amount(total_out_match.group(1))
+                            simplii_total_out = self._parse_amount(
+                                total_out_match.group(1)
+                            )
+
                         if total_in_match:
-                            simplii_total_in = self._parse_amount(total_in_match.group(1))
-                        page_rows = self._extract_simplii_page_transactions(page)
+                            simplii_total_in = self._parse_amount(
+                                total_in_match.group(1)
+                            )
+
+                        page_rows = (
+                            self._extract_simplii_page_transactions(
+                                page
+                            )
+                        )
                     elif self.profile.parser == "td_visa_credit_card":
                         (
                             page_previous_balance,
@@ -2969,6 +3070,25 @@ class VisaPDFProcessor:
             raise PDFProcessingError(
                 f"The PDF contains readable text, but no transaction table matching "
                 f"profile '{self.profile.display_name}' was found."
+            )
+
+        if self.profile.parser == "simplii_chequing_account":
+            if (
+                simplii_statement_start is None
+                or simplii_statement_end is None
+            ):
+                raise PDFProcessingError(
+                    "Simplii statement period was not found. "
+                    "Transaction years cannot be resolved safely."
+                )
+
+            metadata = StatementMetadata(
+                source_file=metadata.source_file,
+                profile_id=metadata.profile_id,
+                institution=metadata.institution,
+                document_type=metadata.document_type,
+                statement_start_date=simplii_statement_start,
+                statement_end_date=simplii_statement_end,
             )
 
         transactions = pd.DataFrame(all_rows, columns=self.required_headers)

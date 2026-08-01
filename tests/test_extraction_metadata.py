@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 import unittest
 
@@ -5,6 +6,7 @@ import pandas as pd
 
 from src.bill_extractor.pdf_processor import (
     ExtractionResult,
+    PDFProcessingError,
     VisaPDFProcessor,
 )
 
@@ -60,6 +62,59 @@ class ExtractionMetadataTest(unittest.TestCase):
         )
         self.assertIsNone(metadata.statement_start_date)
         self.assertIsNone(metadata.statement_end_date)
+
+    def test_simplii_statement_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_simplii_statement_period(
+                "statement period: December 30, 2024 - "
+                "January 29, 2025"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2024, 12, 30),
+        )
+        self.assertEqual(
+            end,
+            date(2025, 1, 29),
+        )
+
+    def test_missing_simplii_period_returns_none(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        self.assertEqual(
+            processor._extract_simplii_statement_period(
+                "No statement period is present."
+            ),
+            (None, None),
+        )
+
+    def test_invalid_simplii_period_is_rejected(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        with self.assertRaisesRegex(
+            PDFProcessingError,
+            "Invalid Simplii statement-period date",
+        ):
+            processor._extract_simplii_statement_period(
+                "statement period: February 30, 2025 - "
+                "March 30, 2025"
+            )
 
 
 if __name__ == "__main__":

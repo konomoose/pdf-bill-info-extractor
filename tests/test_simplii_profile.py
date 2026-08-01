@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 import fitz
@@ -142,6 +143,17 @@ class SimpliiChequingProfileTest(unittest.TestCase):
         self.assertEqual(last["Funds out"], "")
         self.assertEqual(last["Funds in"], "0.03")
         self.assertEqual(last["Balance"].replace(",", ""), "7427.79")
+
+    def test_statement_metadata_period(self) -> None:
+        self.assertIsNotNone(self.result.metadata)
+        self.assertEqual(
+            self.result.metadata.statement_start_date,
+            date(2024, 12, 30),
+        )
+        self.assertEqual(
+            self.result.metadata.statement_end_date,
+            date(2025, 1, 29),
+        )
 
     def test_candidate_csv_is_created(self) -> None:
         self.assertTrue(self.output_csv.is_file())

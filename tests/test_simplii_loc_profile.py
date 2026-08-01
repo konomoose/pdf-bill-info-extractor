@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -114,6 +115,17 @@ class SimpliiLOCProfileTest(unittest.TestCase):
         )
         self.assertEqual(len(transactions), 2)
         self.assertEqual(self.result.source_pages, (1,))
+
+    def test_statement_metadata_period(self) -> None:
+        self.assertIsNotNone(self.result.metadata)
+        self.assertEqual(
+            self.result.metadata.statement_start_date,
+            date(2024, 12, 30),
+        )
+        self.assertEqual(
+            self.result.metadata.statement_end_date,
+            date(2025, 1, 29),
+        )
 
     def test_statement_totals(self) -> None:
         transactions = self.result.transactions
