@@ -18,6 +18,7 @@ from .profile_loader import (
     ProfileError,
     load_profile,
 )
+from .statement_metadata import StatementMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,7 @@ class ExtractionResult:
     transactions: pd.DataFrame
     source_pages: tuple[int, ...]
     ghostscript_path: str | None
+    metadata: StatementMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -217,6 +219,17 @@ class VisaPDFProcessor:
         self.excluded_page_phrases = list(self.profile.excluded_page_phrases)
         self.line_tolerance = self.profile.line_tolerance
         self.continuation_gap = self.profile.continuation_gap
+
+    def _build_statement_metadata(
+        self,
+        source_path: Path,
+    ) -> StatementMetadata:
+        return StatementMetadata(
+            source_file=source_path,
+            profile_id=self.profile.profile_id,
+            institution=self.profile.institution,
+            document_type=self.profile.document_type,
+        )
 
     @staticmethod
     def detect_ghostscript() -> str | None:
@@ -2750,6 +2763,7 @@ class VisaPDFProcessor:
         if not source_path.is_file():
             raise PDFProcessingError(f"PDF file not found: {source_path}")
 
+        metadata = self._build_statement_metadata(source_path)
         ghostscript_path = self.detect_ghostscript()
         if ghostscript_path:
             logger.info("Ghostscript detected at %s.", ghostscript_path)
@@ -2949,6 +2963,7 @@ class VisaPDFProcessor:
                     ),
                     source_pages=tuple(),
                     ghostscript_path=ghostscript_path,
+                    metadata=metadata,
                 )
 
             raise PDFProcessingError(
@@ -3006,6 +3021,7 @@ class VisaPDFProcessor:
             transactions=transactions,
             source_pages=tuple(source_pages),
             ghostscript_path=ghostscript_path,
+            metadata=metadata,
         )
 
     def _capital_one_summary_amount(
