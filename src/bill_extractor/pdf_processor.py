@@ -71,6 +71,16 @@ RBC_CHQ_CLOSING_BALANCE_RE = re.compile(
     r"=?\s*\$?([\d,]+\.\d{2})",
     re.IGNORECASE,
 )
+RBC_CHQ_OPENING_DATE_RE = re.compile(
+    r"Your\s+opening\s+balance\s+on\s+"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
+RBC_CHQ_CLOSING_DATE_RE = re.compile(
+    r"Your\s+closing\s+balance\s+on\s+"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
 SIMPLII_BALANCE_RE = re.compile(
     r"^(?:-\$?\d[\d,]*\.\d{2}|\$?\d[\d,]*\.\d{2}-?)(?:\*+)?$"
 )
@@ -2367,6 +2377,63 @@ class VisaPDFProcessor:
             get_amount(RBC_CHQ_CLOSING_BALANCE_RE),
         )
 
+    @staticmethod
+    def _extract_rbc_chequing_statement_period(
+        page_text: str,
+    ) -> tuple[date | None, date | None]:
+        normalized = VisaPDFProcessor._normalize_text(
+            page_text
+        )
+
+        def parse_date(
+            pattern: re.Pattern[str],
+            label: str,
+        ) -> date | None:
+            match = pattern.search(normalized)
+
+            if match is None:
+                return None
+
+            value = match.group(1)
+
+            for date_format in (
+                "%B %d, %Y",
+                "%b %d, %Y",
+            ):
+                try:
+                    return datetime.strptime(
+                        value,
+                        date_format,
+                    ).date()
+                except ValueError:
+                    continue
+
+            raise PDFProcessingError(
+                f"Invalid RBC Chequing {label} date: "
+                f"{value!r}."
+            )
+
+        statement_start = parse_date(
+            RBC_CHQ_OPENING_DATE_RE,
+            "opening-balance",
+        )
+        statement_end = parse_date(
+            RBC_CHQ_CLOSING_DATE_RE,
+            "closing-balance",
+        )
+
+        if (
+            statement_start is not None
+            and statement_end is not None
+            and statement_start > statement_end
+        ):
+            raise PDFProcessingError(
+                "RBC Chequing opening-balance date is later "
+                "than its closing-balance date."
+            )
+
+        return statement_start, statement_end
+
     def _validate_rbc_chequing_totals(
         self,
         transactions: pd.DataFrame,
@@ -2845,6 +2912,8 @@ class VisaPDFProcessor:
         rbc_chq_total_deposits: Decimal | None = None
         rbc_chq_total_withdrawals: Decimal | None = None
         rbc_chq_closing_balance: Decimal | None = None
+        rbc_chq_statement_start: date | None = None
+        rbc_chq_statement_end: date | None = None
         rbc_chq_current_date: str | None = None
         rbc_chq_pending_description = ""
 
@@ -2965,6 +3034,45 @@ class VisaPDFProcessor:
                             rbc_total_balance = page_total_balance
                         page_rows = self._extract_rbc_page_transactions(page)
                     elif self.profile.parser == "rbc_chequing_account":
+                        (
+                            page_statement_start,
+                            page_statement_end,
+                        ) = (
+                            self._extract_rbc_chequing_statement_period(
+                                page_text
+                            )
+                        )
+
+                        if page_statement_start is not None:
+                            if (
+                                rbc_chq_statement_start is not None
+                                and page_statement_start
+                                != rbc_chq_statement_start
+                            ):
+                                raise PDFProcessingError(
+                                    "Conflicting RBC Chequing opening "
+                                    "dates were found in the PDF."
+                                )
+
+                            rbc_chq_statement_start = (
+                                page_statement_start
+                            )
+
+                        if page_statement_end is not None:
+                            if (
+                                rbc_chq_statement_end is not None
+                                and page_statement_end
+                                != rbc_chq_statement_end
+                            ):
+                                raise PDFProcessingError(
+                                    "Conflicting RBC Chequing closing "
+                                    "dates were found in the PDF."
+                                )
+
+                            rbc_chq_statement_end = (
+                                page_statement_end
+                            )
+
                         (
                             page_opening,
                             page_deposits,
@@ -3089,6 +3197,25 @@ class VisaPDFProcessor:
                 document_type=metadata.document_type,
                 statement_start_date=simplii_statement_start,
                 statement_end_date=simplii_statement_end,
+            )
+
+        if self.profile.parser == "rbc_chequing_account":
+            if (
+                rbc_chq_statement_start is None
+                or rbc_chq_statement_end is None
+            ):
+                raise PDFProcessingError(
+                    "RBC Chequing statement period was not found. "
+                    "Transaction years cannot be resolved safely."
+                )
+
+            metadata = StatementMetadata(
+                source_file=metadata.source_file,
+                profile_id=metadata.profile_id,
+                institution=metadata.institution,
+                document_type=metadata.document_type,
+                statement_start_date=rbc_chq_statement_start,
+                statement_end_date=rbc_chq_statement_end,
             )
 
         transactions = pd.DataFrame(all_rows, columns=self.required_headers)

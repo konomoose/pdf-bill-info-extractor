@@ -116,6 +116,61 @@ class ExtractionMetadataTest(unittest.TestCase):
                 "March 30, 2025"
             )
 
+    def test_rbc_chequing_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_rbc_chequing_statement_period(
+                "Your opening balance on December 20, 2024 "
+                "$100.00 Your closing balance on "
+                "January 21, 2025 = $200.00"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2024, 12, 20),
+        )
+        self.assertEqual(
+            end,
+            date(2025, 1, 21),
+        )
+
+    def test_missing_rbc_chequing_period_returns_none(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        self.assertEqual(
+            processor._extract_rbc_chequing_statement_period(
+                "No balance dates are present."
+            ),
+            (None, None),
+        )
+
+    def test_invalid_rbc_chequing_period_is_rejected(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        with self.assertRaisesRegex(
+            PDFProcessingError,
+            "Invalid RBC Chequing opening-balance date",
+        ):
+            processor._extract_rbc_chequing_statement_period(
+                "Your opening balance on February 30, 2025 "
+                "$100.00 Your closing balance on "
+                "March 21, 2025 = $200.00"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
