@@ -171,6 +171,59 @@ class ExtractionMetadataTest(unittest.TestCase):
                 "March 21, 2025 = $200.00"
             )
 
+    def test_rbc_loc_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_rbc_loc_statement_period(
+                "Principal balance on March 19, 2025 "
+                "Principal balance on April 21, 2025"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2025, 3, 19),
+        )
+        self.assertEqual(
+            end,
+            date(2025, 4, 21),
+        )
+
+    def test_missing_rbc_loc_period_returns_none(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        self.assertEqual(
+            processor._extract_rbc_loc_statement_period(
+                "No principal-balance dates are present."
+            ),
+            (None, None),
+        )
+
+    def test_invalid_rbc_loc_period_is_rejected(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        with self.assertRaisesRegex(
+            PDFProcessingError,
+            "Invalid RBC LOC principal-balance date",
+        ):
+            processor._extract_rbc_loc_statement_period(
+                "Principal balance on February 30, 2025 "
+                "Principal balance on March 30, 2025"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

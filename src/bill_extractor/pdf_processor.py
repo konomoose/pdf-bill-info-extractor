@@ -120,6 +120,11 @@ RBC_LOC_PRINCIPAL_BALANCE_RE = re.compile(
     r"\$?([\d,]+\.\d{2})",
     re.IGNORECASE,
 )
+RBC_LOC_PRINCIPAL_DATE_RE = re.compile(
+    r"Principal\s+balance\s+on\s+"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
 
 RBC_LOC_WITHDRAWALS_RE = re.compile(
     r"Sum\s+of\s+withdrawals\s+including\s+adjustments\s+"
@@ -2783,6 +2788,60 @@ class VisaPDFProcessor:
             closing_balance,
         )
 
+    @staticmethod
+    def _extract_rbc_loc_statement_period(
+        page_text: str,
+    ) -> tuple[date | None, date | None]:
+        normalized = VisaPDFProcessor._normalize_text(
+            page_text
+        )
+        values = RBC_LOC_PRINCIPAL_DATE_RE.findall(
+            normalized
+        )
+
+        # The statement summary contains both the opening and
+        # closing principal-balance dates. Ignore pages containing
+        # only one incidental principal-balance date.
+        if len(values) < 2:
+            return None, None
+
+        parsed_dates: list[date] = []
+
+        for value in values:
+            parsed_date: date | None = None
+
+            for date_format in (
+                "%B %d, %Y",
+                "%b %d, %Y",
+            ):
+                try:
+                    parsed_date = datetime.strptime(
+                        value,
+                        date_format,
+                    ).date()
+                    break
+                except ValueError:
+                    continue
+
+            if parsed_date is None:
+                raise PDFProcessingError(
+                    "Invalid RBC LOC principal-balance date: "
+                    f"{value!r}."
+                )
+
+            parsed_dates.append(parsed_date)
+
+        statement_start = parsed_dates[0]
+        statement_end = parsed_dates[-1]
+
+        if statement_start > statement_end:
+            raise PDFProcessingError(
+                "RBC LOC opening principal-balance date is "
+                "later than its closing date."
+            )
+
+        return statement_start, statement_end
+
     def _validate_rbc_loc_totals(
         self,
         transactions: pd.DataFrame,
@@ -2923,6 +2982,8 @@ class VisaPDFProcessor:
         rbc_loc_total_interest: Decimal | None = None
         rbc_loc_total_fees: Decimal | None = None
         rbc_loc_closing_balance: Decimal | None = None
+        rbc_loc_statement_start: date | None = None
+        rbc_loc_statement_end: date | None = None
         rbc_loc_current_date: str | None = None
         rbc_loc_pending_description = ""
 
@@ -3100,6 +3161,41 @@ class VisaPDFProcessor:
                         )
                     elif self.profile.parser == "rbc_loc":
                         (
+                            page_statement_start,
+                            page_statement_end,
+                        ) = self._extract_rbc_loc_statement_period(
+                            page_text
+                        )
+
+                        if (
+                            page_statement_start is not None
+                            and page_statement_end is not None
+                        ):
+                            page_period = (
+                                page_statement_start,
+                                page_statement_end,
+                            )
+
+                            if rbc_loc_statement_start is not None:
+                                current_period = (
+                                    rbc_loc_statement_start,
+                                    rbc_loc_statement_end,
+                                )
+
+                                if page_period != current_period:
+                                    raise PDFProcessingError(
+                                        "Conflicting RBC LOC statement "
+                                        "periods were found in the PDF."
+                                    )
+
+                            rbc_loc_statement_start = (
+                                page_statement_start
+                            )
+                            rbc_loc_statement_end = (
+                                page_statement_end
+                            )
+
+                        (
                             page_opening,
                             page_withdrawals,
                             page_payments,
@@ -3216,6 +3312,25 @@ class VisaPDFProcessor:
                 document_type=metadata.document_type,
                 statement_start_date=rbc_chq_statement_start,
                 statement_end_date=rbc_chq_statement_end,
+            )
+
+        if self.profile.parser == "rbc_loc":
+            if (
+                rbc_loc_statement_start is None
+                or rbc_loc_statement_end is None
+            ):
+                raise PDFProcessingError(
+                    "RBC LOC statement period was not found. "
+                    "Transaction years cannot be resolved safely."
+                )
+
+            metadata = StatementMetadata(
+                source_file=metadata.source_file,
+                profile_id=metadata.profile_id,
+                institution=metadata.institution,
+                document_type=metadata.document_type,
+                statement_start_date=rbc_loc_statement_start,
+                statement_end_date=rbc_loc_statement_end,
             )
 
         transactions = pd.DataFrame(all_rows, columns=self.required_headers)

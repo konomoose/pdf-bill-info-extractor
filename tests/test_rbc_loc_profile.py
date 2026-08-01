@@ -1,9 +1,13 @@
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 import unittest
 
 from src.bill_extractor.pdf_processor import VisaPDFProcessor
 from src.bill_extractor.profile_loader import load_profile
+from src.bill_extractor.transaction_normalizer import (
+    normalize_transactions,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -146,6 +150,32 @@ class RBCLocExtractionTest(unittest.TestCase):
     def test_known_transaction_count_and_pages(self):
         self.assertEqual(len(self.transactions), 10)
         self.assertEqual(self.result.source_pages, (1, 2))
+
+    def test_statement_metadata_period(self):
+        self.assertIsNotNone(self.result.metadata)
+        self.assertEqual(
+            self.result.metadata.statement_start_date,
+            date(2025, 3, 19),
+        )
+        self.assertEqual(
+            self.result.metadata.statement_end_date,
+            date(2025, 4, 21),
+        )
+
+    def test_normalized_transaction_dates(self):
+        normalized = normalize_transactions(
+            self.result.transactions,
+            self.result.metadata,
+        )
+
+        self.assertEqual(
+            normalized.iloc[0]["transaction_date"],
+            "2025-03-21",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["transaction_date"],
+            "2025-04-21",
+        )
 
 
 class RBCLocAnnualSummaryTest(unittest.TestCase):
