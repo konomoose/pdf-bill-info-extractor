@@ -377,6 +377,39 @@ class TransactionNormalizerTest(unittest.TestCase):
                 ),
             )
 
+    def test_effective_date_may_follow_period_end(
+        self,
+    ) -> None:
+        result = normalize_transactions(
+            pd.DataFrame(
+                [
+                    {
+                        "Trans. date": "Jan 29",
+                        "Eff. date": "Jan 30",
+                        "Transaction": "Interest",
+                        "Funds out": "",
+                        "Funds in": "0.03",
+                        "Balance": "100.03",
+                    }
+                ]
+            ),
+            make_metadata(
+                "simplii_chequing_account_v1",
+                "bank_account_statement",
+                start=date(2024, 12, 30),
+                end=date(2025, 1, 29),
+            ),
+        )
+
+        self.assertEqual(
+            result.loc[0, "transaction_date"],
+            "2025-01-29",
+        )
+        self.assertEqual(
+            result.loc[0, "effective_date"],
+            "2025-01-30",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

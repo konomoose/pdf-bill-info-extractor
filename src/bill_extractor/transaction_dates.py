@@ -185,3 +185,82 @@ def resolve_transaction_date(
         )
 
     return candidates[0]
+
+
+def resolve_related_date(
+    value: str,
+    anchor_date: date,
+    *,
+    max_distance_days: int = 45,
+) -> date:
+    """
+    Resolve a posting or effective date relative to its transaction date.
+
+    Related dates may fall just outside the statement period. The closest
+    valid date within max_distance_days is selected without guessing a year.
+    """
+
+    if max_distance_days < 0:
+        raise TransactionDateError(
+            "max_distance_days cannot be negative."
+        )
+
+    cleaned = _clean_date_text(value)
+
+    if _ISO_DATE_RE.fullmatch(cleaned):
+        try:
+            resolved = date.fromisoformat(cleaned)
+        except ValueError as exc:
+            raise TransactionDateError(
+                f"Invalid ISO related date: {cleaned!r}."
+            ) from exc
+
+        if abs((resolved - anchor_date).days) > max_distance_days:
+            raise TransactionDateError(
+                f"Related date {resolved.isoformat()} is too far from "
+                f"transaction date {anchor_date.isoformat()}."
+            )
+
+        return resolved
+
+    month, day = _parse_partial_month_day(cleaned)
+    candidates: list[date] = []
+
+    for year in range(
+        anchor_date.year - 1,
+        anchor_date.year + 2,
+    ):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            continue
+
+        if abs((candidate - anchor_date).days) <= max_distance_days:
+            candidates.append(candidate)
+
+    if not candidates:
+        raise TransactionDateError(
+            f"Related date {cleaned!r} cannot be resolved within "
+            f"{max_distance_days} days of "
+            f"{anchor_date.isoformat()}."
+        )
+
+    nearest_distance = min(
+        abs((candidate - anchor_date).days)
+        for candidate in candidates
+    )
+
+    nearest = [
+        candidate
+        for candidate in candidates
+        if abs((candidate - anchor_date).days)
+        == nearest_distance
+    ]
+
+    if len(nearest) != 1:
+        raise TransactionDateError(
+            f"Related date {cleaned!r} is ambiguous relative to "
+            f"{anchor_date.isoformat()}."
+        )
+
+    return nearest[0]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -8,6 +9,7 @@ import pandas as pd
 from .statement_metadata import StatementMetadata
 from .transaction_dates import (
     TransactionDateError,
+    resolve_related_date,
     resolve_transaction_date,
 )
 
@@ -110,8 +112,7 @@ PROFILE_MAPPINGS = {
 }
 
 
-_DATE_FIELDS = {
-    "transaction_date",
+_SECONDARY_DATE_FIELDS = {
     "posting_date",
     "effective_date",
 }
@@ -194,6 +195,24 @@ def _normalize_date(
     return resolved.isoformat()
 
 
+def _normalize_related_date(
+    value: Any,
+    anchor_date: date,
+) -> str:
+    if _is_blank(value):
+        return ""
+
+    try:
+        resolved = resolve_related_date(
+            str(value),
+            anchor_date,
+        )
+    except TransactionDateError as exc:
+        raise NormalizationError(str(exc)) from exc
+
+    return resolved.isoformat()
+
+
 def normalize_transactions(
     transactions: pd.DataFrame,
     metadata: StatementMetadata,
@@ -231,13 +250,36 @@ def normalize_transactions(
             for column in NORMALIZED_COLUMNS
         }
 
+        transaction_source_column = mapping[
+            "transaction_date"
+        ]
+
+        normalized["transaction_date"] = _normalize_date(
+            source_row[transaction_source_column],
+            metadata,
+        )
+
+        if not normalized["transaction_date"]:
+            raise NormalizationError(
+                f"Row {row_number} has no transaction date."
+            )
+
+        anchor_date = date.fromisoformat(
+            normalized["transaction_date"]
+        )
+
         for target_column, source_column in mapping.items():
+            if target_column == "transaction_date":
+                continue
+
             value = source_row[source_column]
 
-            if target_column in _DATE_FIELDS:
-                normalized[target_column] = _normalize_date(
-                    value,
-                    metadata,
+            if target_column in _SECONDARY_DATE_FIELDS:
+                normalized[target_column] = (
+                    _normalize_related_date(
+                        value,
+                        anchor_date,
+                    )
                 )
             elif target_column in _MONEY_FIELDS:
                 normalized[target_column] = _normalize_money(
@@ -247,11 +289,6 @@ def normalize_transactions(
                 normalized[target_column] = _normalize_text(
                     value
                 )
-
-        if not normalized["transaction_date"]:
-            raise NormalizationError(
-                f"Row {row_number} has no transaction date."
-            )
 
         if not normalized["description"]:
             raise NormalizationError(

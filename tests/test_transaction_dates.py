@@ -5,6 +5,7 @@ import unittest
 from src.bill_extractor.statement_metadata import StatementMetadata
 from src.bill_extractor.transaction_dates import (
     TransactionDateError,
+    resolve_related_date,
     resolve_transaction_date,
 )
 
@@ -125,6 +126,44 @@ class TransactionDateResolutionTest(unittest.TestCase):
                     date(2025, 1, 1),
                     date(2026, 1, 31),
                 ),
+            )
+
+    def test_related_date_can_follow_statement_end(
+        self,
+    ) -> None:
+        result = resolve_related_date(
+            "Jan 30",
+            date(2025, 1, 29),
+        )
+
+        self.assertEqual(
+            result,
+            date(2025, 1, 30),
+        )
+
+    def test_related_date_crosses_calendar_year(
+        self,
+    ) -> None:
+        result = resolve_related_date(
+            "Jan 2",
+            date(2025, 12, 31),
+        )
+
+        self.assertEqual(
+            result,
+            date(2026, 1, 2),
+        )
+
+    def test_related_date_too_far_is_rejected(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            TransactionDateError,
+            "cannot be resolved",
+        ):
+            resolve_related_date(
+                "Dec 1",
+                date(2025, 3, 15),
             )
 
 
