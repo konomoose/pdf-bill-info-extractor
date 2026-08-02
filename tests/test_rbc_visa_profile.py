@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import re
 import unittest
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 
 from src.bill_extractor.pdf_processor import VisaPDFProcessor
 from src.bill_extractor.profile_loader import load_profile
+from src.bill_extractor.transaction_normalizer import (
+    normalize_transactions,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = PROJECT_ROOT / "config" / "profiles" / "rbc_visa_credit_card.json"
@@ -143,6 +147,40 @@ class RBCVisaProfileTest(unittest.TestCase):
 
         for description in self.result.transactions["Activity description"]:
             self.assertIsNone(reference_number.search(description))
+
+    def test_statement_metadata_period(self) -> None:
+        self.assertIsNotNone(self.result.metadata)
+        self.assertEqual(
+            self.result.metadata.statement_start_date,
+            date(2024, 12, 10),
+        )
+        self.assertEqual(
+            self.result.metadata.statement_end_date,
+            date(2025, 1, 9),
+        )
+
+    def test_normalized_transaction_dates(self) -> None:
+        normalized = normalize_transactions(
+            self.result.transactions,
+            self.result.metadata,
+        )
+
+        self.assertEqual(
+            normalized.iloc[0]["transaction_date"],
+            "2024-12-14",
+        )
+        self.assertEqual(
+            normalized.iloc[0]["posting_date"],
+            "2024-12-16",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["transaction_date"],
+            "2025-01-04",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["posting_date"],
+            "2025-01-06",
+        )
 
     def test_candidate_csv_is_created(self) -> None:
         self.assertTrue(self.output_csv.is_file())

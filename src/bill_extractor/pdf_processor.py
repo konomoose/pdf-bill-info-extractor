@@ -48,6 +48,12 @@ RBC_TOTAL_BALANCE_RE = re.compile(
     r"(-?\$?\d[\d,]*\.\d{2})",
     re.IGNORECASE,
 )
+RBC_VISA_STATEMENT_PERIOD_RE = re.compile(
+    r"Statement\s+(?:period|from)\s*:?\s*"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s*(?:-|to|through)\s*"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
 
 RBC_CHQ_OPENING_BALANCE_RE = re.compile(
     r"Your\s+opening\s+balance\s+on\s+"
@@ -2100,6 +2106,56 @@ class VisaPDFProcessor:
 
         return previous_balance, total_balance
 
+    @staticmethod
+    def _extract_rbc_visa_statement_period(
+        page_text: str,
+    ) -> tuple[date | None, date | None]:
+        normalized = VisaPDFProcessor._normalize_text(
+            page_text
+        )
+        match = RBC_VISA_STATEMENT_PERIOD_RE.search(
+            normalized
+        )
+
+        if match is None:
+            return None, None
+
+        parsed_dates: list[date] = []
+
+        for value in match.groups():
+            parsed_date: date | None = None
+
+            for date_format in (
+                "%B %d, %Y",
+                "%b %d, %Y",
+            ):
+                try:
+                    parsed_date = datetime.strptime(
+                        value,
+                        date_format,
+                    ).date()
+                    break
+                except ValueError:
+                    continue
+
+            if parsed_date is None:
+                raise PDFProcessingError(
+                    "Invalid RBC Visa statement-period date: "
+                    f"{value!r}."
+                )
+
+            parsed_dates.append(parsed_date)
+
+        statement_start, statement_end = parsed_dates
+
+        if statement_start > statement_end:
+            raise PDFProcessingError(
+                "RBC Visa statement-period start date is "
+                "later than its end date."
+            )
+
+        return statement_start, statement_end
+
     def _validate_rbc_balance(
         self,
         transactions: pd.DataFrame,
@@ -2963,6 +3019,8 @@ class VisaPDFProcessor:
         td_new_balance: Decimal | None = None
         rbc_previous_balance: Decimal | None = None
         rbc_total_balance: Decimal | None = None
+        rbc_visa_statement_start: date | None = None
+        rbc_visa_statement_end: date | None = None
 
         capital_one_previous_balance: Decimal | None = None
         capital_one_new_balance: Decimal | None = None
@@ -3085,6 +3143,41 @@ class VisaPDFProcessor:
                             td_new_balance = page_new_balance
                         page_rows = self._extract_td_page_transactions(page)
                     elif self.profile.parser == "rbc_visa_credit_card":
+                        (
+                            page_statement_start,
+                            page_statement_end,
+                        ) = self._extract_rbc_visa_statement_period(
+                            page_text
+                        )
+
+                        if (
+                            page_statement_start is not None
+                            and page_statement_end is not None
+                        ):
+                            page_period = (
+                                page_statement_start,
+                                page_statement_end,
+                            )
+
+                            if rbc_visa_statement_start is not None:
+                                current_period = (
+                                    rbc_visa_statement_start,
+                                    rbc_visa_statement_end,
+                                )
+
+                                if page_period != current_period:
+                                    raise PDFProcessingError(
+                                        "Conflicting RBC Visa statement "
+                                        "periods were found in the PDF."
+                                    )
+
+                            rbc_visa_statement_start = (
+                                page_statement_start
+                            )
+                            rbc_visa_statement_end = (
+                                page_statement_end
+                            )
+
                         (
                             page_previous_balance,
                             page_total_balance,
@@ -3293,6 +3386,25 @@ class VisaPDFProcessor:
                 document_type=metadata.document_type,
                 statement_start_date=simplii_statement_start,
                 statement_end_date=simplii_statement_end,
+            )
+
+        if self.profile.parser == "rbc_visa_credit_card":
+            if (
+                rbc_visa_statement_start is None
+                or rbc_visa_statement_end is None
+            ):
+                raise PDFProcessingError(
+                    "RBC Visa statement period was not found. "
+                    "Transaction years cannot be resolved safely."
+                )
+
+            metadata = StatementMetadata(
+                source_file=metadata.source_file,
+                profile_id=metadata.profile_id,
+                institution=metadata.institution,
+                document_type=metadata.document_type,
+                statement_start_date=rbc_visa_statement_start,
+                statement_end_date=rbc_visa_statement_end,
             )
 
         if self.profile.parser == "rbc_chequing_account":

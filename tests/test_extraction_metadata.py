@@ -224,6 +224,59 @@ class ExtractionMetadataTest(unittest.TestCase):
                 "Principal balance on March 30, 2025"
             )
 
+    def test_rbc_visa_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_rbc_visa_statement_period(
+                "Statement from DEC 10, 2024 to "
+                "JAN 09, 2025"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2024, 12, 10),
+        )
+        self.assertEqual(
+            end,
+            date(2025, 1, 9),
+        )
+
+    def test_missing_rbc_visa_period_returns_none(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        self.assertEqual(
+            processor._extract_rbc_visa_statement_period(
+                "No statement period is present."
+            ),
+            (None, None),
+        )
+
+    def test_invalid_rbc_visa_period_is_rejected(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        with self.assertRaisesRegex(
+            PDFProcessingError,
+            "Invalid RBC Visa statement-period date",
+        ):
+            processor._extract_rbc_visa_statement_period(
+                "Statement period: FEB 30, 2025 - "
+                "MAR 30, 2025"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
