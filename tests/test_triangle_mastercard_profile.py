@@ -1,8 +1,12 @@
+from datetime import date
 from pathlib import Path
 import unittest
 
 from src.bill_extractor.pdf_processor import VisaPDFProcessor
 from src.bill_extractor.profile_loader import load_profile
+from src.bill_extractor.transaction_normalizer import (
+    normalize_transactions,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +80,58 @@ class TriangleMastercardProfileTest(unittest.TestCase):
         )
         self.assertTrue(
             result.transactions["Amount($)"].str.strip().ne("").all()
+        )
+
+    @unittest.skipUnless(
+        KNOWN_PDF.is_file(),
+        "Local Triangle Mastercard regression statement is unavailable.",
+    )
+    def test_statement_metadata_period(self):
+        profile = load_profile(PROFILE_PATH)
+        result = VisaPDFProcessor(
+            profile=profile
+        ).extract_transactions(KNOWN_PDF)
+
+        self.assertIsNotNone(result.metadata)
+        self.assertEqual(
+            result.metadata.statement_start_date,
+            date(2023, 5, 13),
+        )
+        self.assertEqual(
+            result.metadata.statement_end_date,
+            date(2023, 6, 12),
+        )
+
+    @unittest.skipUnless(
+        KNOWN_PDF.is_file(),
+        "Local Triangle Mastercard regression statement is unavailable.",
+    )
+    def test_normalized_transaction_dates(self):
+        profile = load_profile(PROFILE_PATH)
+        result = VisaPDFProcessor(
+            profile=profile
+        ).extract_transactions(KNOWN_PDF)
+
+        normalized = normalize_transactions(
+            result.transactions,
+            result.metadata,
+        )
+
+        self.assertEqual(
+            normalized.iloc[0]["transaction_date"],
+            "2023-05-16",
+        )
+        self.assertEqual(
+            normalized.iloc[0]["posting_date"],
+            "2023-05-17",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["transaction_date"],
+            "2023-05-26",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["posting_date"],
+            "2023-05-29",
         )
 
 

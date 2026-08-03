@@ -112,6 +112,13 @@ SIMPLII_STATEMENT_PERIOD_RE = re.compile(
     r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
     re.IGNORECASE,
 )
+TRIANGLE_STATEMENT_PERIOD_RE = re.compile(
+    r"For\s+the\s+period\s*:?\s*"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s*"
+    r"(?:-|to|through)\s*"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
 TRIANGLE_DATE_RE = re.compile(
     rf"^{MONTHS}\s*\d{{1,2}}$",
     re.IGNORECASE,
@@ -622,6 +629,63 @@ class VisaPDFProcessor:
         return rows
 
     # Triangle Mastercard parser ---------------------------------------------
+
+    @staticmethod
+    def _extract_triangle_statement_period(
+        page_text: str,
+    ) -> tuple[date | None, date | None]:
+        normalized = VisaPDFProcessor._normalize_text(
+            page_text
+        )
+        match = TRIANGLE_STATEMENT_PERIOD_RE.search(
+            normalized
+        )
+
+        if match is None:
+            return None, None
+
+        parsed_dates: list[date] = []
+
+        for value in match.groups():
+            cleaned = re.sub(
+                r"^Sept\b",
+                "Sep",
+                value,
+                flags=re.IGNORECASE,
+            )
+            parsed_date: date | None = None
+
+            for date_format in (
+                "%B %d, %Y",
+                "%b %d, %Y",
+            ):
+                try:
+                    parsed_date = datetime.strptime(
+                        cleaned,
+                        date_format,
+                    ).date()
+                    break
+                except ValueError:
+                    continue
+
+            if parsed_date is None:
+                raise PDFProcessingError(
+                    "Invalid Triangle Mastercard "
+                    "statement-period date: "
+                    f"{value!r}."
+                )
+
+            parsed_dates.append(parsed_date)
+
+        statement_start, statement_end = parsed_dates
+
+        if statement_start > statement_end:
+            raise PDFProcessingError(
+                "Triangle Mastercard statement-period "
+                "start date is later than its end date."
+            )
+
+        return statement_start, statement_end
 
     def _find_triangle_transaction_headers(
         self,
@@ -3175,6 +3239,8 @@ class VisaPDFProcessor:
         total_text_characters = 0
         cibc_statement_start: date | None = None
         cibc_statement_end: date | None = None
+        triangle_statement_start: date | None = None
+        triangle_statement_end: date | None = None
         simplii_total_out: Decimal | None = None
         simplii_total_in: Decimal | None = None
         simplii_statement_start: date | None = None
@@ -3260,7 +3326,47 @@ class VisaPDFProcessor:
                             )
                         )
                     elif self.profile.parser == "triangle_mastercard":
-                        page_rows = self._extract_triangle_page_transactions(page)
+                        (
+                            page_statement_start,
+                            page_statement_end,
+                        ) = self._extract_triangle_statement_period(
+                            page_text
+                        )
+
+                        if (
+                            page_statement_start is not None
+                            and page_statement_end is not None
+                        ):
+                            page_period = (
+                                page_statement_start,
+                                page_statement_end,
+                            )
+
+                            if triangle_statement_start is not None:
+                                current_period = (
+                                    triangle_statement_start,
+                                    triangle_statement_end,
+                                )
+
+                                if page_period != current_period:
+                                    raise PDFProcessingError(
+                                        "Conflicting Triangle Mastercard "
+                                        "statement periods were found "
+                                        "in the PDF."
+                                    )
+
+                            triangle_statement_start = (
+                                page_statement_start
+                            )
+                            triangle_statement_end = (
+                                page_statement_end
+                            )
+
+                        page_rows = (
+                            self._extract_triangle_page_transactions(
+                                page
+                            )
+                        )
                     elif self.profile.parser == "capital_one_mastercard":
                         (
                             page_previous_balance,
@@ -3628,6 +3734,26 @@ class VisaPDFProcessor:
                 document_type=metadata.document_type,
                 statement_start_date=cibc_statement_start,
                 statement_end_date=cibc_statement_end,
+            )
+
+        if self.profile.parser == "triangle_mastercard":
+            if (
+                triangle_statement_start is None
+                or triangle_statement_end is None
+            ):
+                raise PDFProcessingError(
+                    "Triangle Mastercard statement period "
+                    "was not found. Transaction years "
+                    "cannot be resolved safely."
+                )
+
+            metadata = StatementMetadata(
+                source_file=metadata.source_file,
+                profile_id=metadata.profile_id,
+                institution=metadata.institution,
+                document_type=metadata.document_type,
+                statement_start_date=triangle_statement_start,
+                statement_end_date=triangle_statement_end,
             )
 
         if self.profile.parser == "simplii_chequing_account":

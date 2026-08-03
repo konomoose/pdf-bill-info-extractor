@@ -407,6 +407,60 @@ class ExtractionMetadataTest(unittest.TestCase):
                 "March 23, 2024"
             )
 
+    def test_triangle_statement_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_triangle_statement_period(
+                "For the period: May 13, 2023 to "
+                "June 12, 2023"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2023, 5, 13),
+        )
+        self.assertEqual(
+            end,
+            date(2023, 6, 12),
+        )
+
+    def test_missing_triangle_period_returns_none(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        self.assertEqual(
+            processor._extract_triangle_statement_period(
+                "No statement period is present."
+            ),
+            (None, None),
+        )
+
+    def test_invalid_triangle_period_is_rejected(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        with self.assertRaisesRegex(
+            PDFProcessingError,
+            "Invalid Triangle Mastercard "
+            "statement-period date",
+        ):
+            processor._extract_triangle_statement_period(
+                "For the period: February 30, 2023 to "
+                "March 30, 2023"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
