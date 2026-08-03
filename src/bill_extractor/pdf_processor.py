@@ -112,6 +112,16 @@ SIMPLII_STATEMENT_PERIOD_RE = re.compile(
     r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
     re.IGNORECASE,
 )
+CAPITAL_ONE_STATEMENT_PERIOD_RE = re.compile(
+    r"Statement\s+Period\s*:?\s*"
+    r"([A-Za-z]+\s+\d{1,2})"
+    r"(?:,\s*(\d{4}))?\s*"
+    r"(?:-|to|through)\s*"
+    r"([A-Za-z]+\s+\d{1,2})"
+    r"(?:,\s*|\s+)(\d{4})",
+    re.IGNORECASE,
+)
+
 TRIANGLE_STATEMENT_PERIOD_RE = re.compile(
     r"For\s+the\s+period\s*:?\s*"
     r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s*"
@@ -967,6 +977,102 @@ class VisaPDFProcessor:
 
 
     # Capital One Mastercard parser ------------------------------------------
+
+    @staticmethod
+    def _extract_capital_one_statement_period(
+        page_text: str,
+    ) -> tuple[date | None, date | None]:
+        normalized = VisaPDFProcessor._normalize_text(
+            page_text
+        )
+        match = CAPITAL_ONE_STATEMENT_PERIOD_RE.search(
+            normalized
+        )
+
+        if match is None:
+            return None, None
+
+        (
+            start_value,
+            start_year_value,
+            end_value,
+            end_year_value,
+        ) = match.groups()
+
+        def parse_month_day(
+            value: str,
+        ) -> tuple[int, int]:
+            cleaned = re.sub(
+                r"^Sept\b",
+                "Sep",
+                value,
+                flags=re.IGNORECASE,
+            )
+
+            for date_format in (
+                "%B %d %Y",
+                "%b %d %Y",
+            ):
+                try:
+                    parsed = datetime.strptime(
+                        f"{cleaned} 2000",
+                        date_format,
+                    )
+                    return parsed.month, parsed.day
+                except ValueError:
+                    continue
+
+            raise PDFProcessingError(
+                "Invalid Capital One Mastercard "
+                "statement-period date: "
+                f"{value!r}."
+            )
+
+        start_month, start_day = parse_month_day(
+            start_value
+        )
+        end_month, end_day = parse_month_day(
+            end_value
+        )
+
+        end_year = int(end_year_value)
+        start_year = (
+            int(start_year_value)
+            if start_year_value is not None
+            else end_year
+        )
+
+        if (
+            start_year_value is None
+            and (start_month, start_day)
+            > (end_month, end_day)
+        ):
+            start_year -= 1
+
+        try:
+            statement_start = date(
+                start_year,
+                start_month,
+                start_day,
+            )
+            statement_end = date(
+                end_year,
+                end_month,
+                end_day,
+            )
+        except ValueError as exc:
+            raise PDFProcessingError(
+                "Invalid Capital One Mastercard "
+                "statement-period date."
+            ) from exc
+
+        if statement_start > statement_end:
+            raise PDFProcessingError(
+                "Capital One Mastercard statement-period "
+                "start date is later than its end date."
+            )
+
+        return statement_start, statement_end
 
     def _find_capital_one_modern_headers(
         self,
@@ -3254,6 +3360,8 @@ class VisaPDFProcessor:
         rbc_visa_statement_start: date | None = None
         rbc_visa_statement_end: date | None = None
 
+        capital_one_statement_start: date | None = None
+        capital_one_statement_end: date | None = None
         capital_one_previous_balance: Decimal | None = None
         capital_one_new_balance: Decimal | None = None
 
@@ -3368,6 +3476,47 @@ class VisaPDFProcessor:
                             )
                         )
                     elif self.profile.parser == "capital_one_mastercard":
+                        (
+                            page_statement_start,
+                            page_statement_end,
+                        ) = (
+                            self._extract_capital_one_statement_period(
+                                page_text
+                            )
+                        )
+
+                        if (
+                            page_statement_start is not None
+                            and page_statement_end is not None
+                        ):
+                            page_period = (
+                                page_statement_start,
+                                page_statement_end,
+                            )
+
+                            if (
+                                capital_one_statement_start
+                                is not None
+                            ):
+                                current_period = (
+                                    capital_one_statement_start,
+                                    capital_one_statement_end,
+                                )
+
+                                if page_period != current_period:
+                                    raise PDFProcessingError(
+                                        "Conflicting Capital One Mastercard "
+                                        "statement periods were found "
+                                        "in the PDF."
+                                    )
+
+                            capital_one_statement_start = (
+                                page_statement_start
+                            )
+                            capital_one_statement_end = (
+                                page_statement_end
+                            )
+
                         (
                             page_previous_balance,
                             page_new_balance,
@@ -3702,6 +3851,30 @@ class VisaPDFProcessor:
                 self.profile.parser == "capital_one_mastercard"
                 and self._is_capital_one_zero_activity_statement(source_path)
             ):
+                # Capital One zero-activity metadata support.
+                if (
+                    capital_one_statement_start is None
+                    or capital_one_statement_end is None
+                ):
+                    raise PDFProcessingError(
+                        "Capital One Mastercard statement "
+                        "period was not found. Transaction "
+                        "years cannot be resolved safely."
+                    )
+
+                metadata = StatementMetadata(
+                    source_file=metadata.source_file,
+                    profile_id=metadata.profile_id,
+                    institution=metadata.institution,
+                    document_type=metadata.document_type,
+                    statement_start_date=(
+                        capital_one_statement_start
+                    ),
+                    statement_end_date=(
+                        capital_one_statement_end
+                    ),
+                )
+
                 return ExtractionResult(
                     transactions=pd.DataFrame(
                         columns=self.required_headers
@@ -3734,6 +3907,30 @@ class VisaPDFProcessor:
                 document_type=metadata.document_type,
                 statement_start_date=cibc_statement_start,
                 statement_end_date=cibc_statement_end,
+            )
+
+        if self.profile.parser == "capital_one_mastercard":
+            if (
+                capital_one_statement_start is None
+                or capital_one_statement_end is None
+            ):
+                raise PDFProcessingError(
+                    "Capital One Mastercard statement "
+                    "period was not found. Transaction "
+                    "years cannot be resolved safely."
+                )
+
+            metadata = StatementMetadata(
+                source_file=metadata.source_file,
+                profile_id=metadata.profile_id,
+                institution=metadata.institution,
+                document_type=metadata.document_type,
+                statement_start_date=(
+                    capital_one_statement_start
+                ),
+                statement_end_date=(
+                    capital_one_statement_end
+                ),
             )
 
         if self.profile.parser == "triangle_mastercard":

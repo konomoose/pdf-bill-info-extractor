@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 import unittest
@@ -9,6 +10,9 @@ from src.bill_extractor.pdf_processor import (
     VisaPDFProcessor,
 )
 from src.bill_extractor.profile_loader import load_profile
+from src.bill_extractor.transaction_normalizer import (
+    normalize_transactions,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +29,18 @@ LOCAL_CORPUS_ROOT = (
     PROJECT_ROOT
     / "editable_input"
     / "capital_one"
+)
+
+LEGACY_CROSS_YEAR_PDF = (
+    LOCAL_CORPUS_ROOT
+    / "2021"
+    / "Statement_012021_1362.pdf"
+)
+
+MODERN_CROSS_YEAR_PDF = (
+    LOCAL_CORPUS_ROOT
+    / "2025"
+    / "Statement_012025_1362.pdf"
 )
 
 EXPECTED_COLUMNS = [
@@ -214,6 +230,102 @@ class CapitalOneMastercardProfileTest(unittest.TestCase):
                 Decimal("111.00"),
             )
 
+    def test_legacy_cross_year_metadata_and_dates(
+        self,
+    ) -> None:
+        if not LEGACY_CROSS_YEAR_PDF.is_file():
+            self.skipTest(
+                "Legacy Capital One regression "
+                "statement is unavailable."
+            )
+
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH
+        )
+        result = processor.extract_transactions(
+            LEGACY_CROSS_YEAR_PDF
+        )
+
+        self.assertIsNotNone(result.metadata)
+        self.assertEqual(
+            result.metadata.statement_start_date,
+            date(2020, 12, 24),
+        )
+        self.assertEqual(
+            result.metadata.statement_end_date,
+            date(2021, 1, 23),
+        )
+
+        normalized = normalize_transactions(
+            result.transactions,
+            result.metadata,
+        )
+
+        self.assertEqual(
+            normalized.iloc[0]["transaction_date"],
+            "2020-12-27",
+        )
+        self.assertEqual(
+            normalized.iloc[0]["posting_date"],
+            "2020-12-28",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["transaction_date"],
+            "2021-01-22",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["posting_date"],
+            "2021-01-22",
+        )
+
+    def test_modern_cross_year_metadata_and_dates(
+        self,
+    ) -> None:
+        if not MODERN_CROSS_YEAR_PDF.is_file():
+            self.skipTest(
+                "Modern Capital One regression "
+                "statement is unavailable."
+            )
+
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH
+        )
+        result = processor.extract_transactions(
+            MODERN_CROSS_YEAR_PDF
+        )
+
+        self.assertIsNotNone(result.metadata)
+        self.assertEqual(
+            result.metadata.statement_start_date,
+            date(2024, 12, 24),
+        )
+        self.assertEqual(
+            result.metadata.statement_end_date,
+            date(2025, 1, 23),
+        )
+
+        normalized = normalize_transactions(
+            result.transactions,
+            result.metadata,
+        )
+
+        self.assertEqual(
+            normalized.iloc[0]["transaction_date"],
+            "2025-01-03",
+        )
+        self.assertEqual(
+            normalized.iloc[0]["posting_date"],
+            "2025-01-06",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["transaction_date"],
+            "2025-01-23",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["posting_date"],
+            "2025-01-23",
+        )
+
     def test_complete_local_corpus(self) -> None:
         if not local_corpus_is_complete():
             self.skipTest(
@@ -246,6 +358,14 @@ class CapitalOneMastercardProfileTest(unittest.TestCase):
             for path in paths:
                 result = processor.extract_transactions(
                     path
+                )
+
+                self.assertIsNotNone(result.metadata)
+                self.assertIsNotNone(
+                    result.metadata.statement_start_date
+                )
+                self.assertIsNotNone(
+                    result.metadata.statement_end_date
                 )
 
                 self.assertEqual(

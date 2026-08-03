@@ -461,6 +461,306 @@ class ExtractionMetadataTest(unittest.TestCase):
                 "March 30, 2023"
             )
 
+    def test_capital_one_legacy_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_capital_one_statement_period(
+                "Statement Period: Nov 24 - "
+                "Dec 23, 2020"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2020, 11, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2020, 12, 23),
+        )
+
+    def test_capital_one_legacy_cross_year_period(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_capital_one_statement_period(
+                "Statement Period: Dec 24 - "
+                "Jan 23, 2021"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2020, 12, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2021, 1, 23),
+        )
+
+    def test_capital_one_modern_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_capital_one_statement_period(
+                "Statement Period: Dec 24, 2024 - "
+                "Jan 23, 2025"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2024, 12, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2025, 1, 23),
+        )
+
+    def test_missing_capital_one_period_returns_none(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        self.assertEqual(
+            processor._extract_capital_one_statement_period(
+                "No billing period is present."
+            ),
+            (None, None),
+        )
+
+    def test_invalid_capital_one_period_is_rejected(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        with self.assertRaisesRegex(
+            PDFProcessingError,
+            "Invalid Capital One Mastercard "
+            "statement-period date",
+        ):
+            processor._extract_capital_one_statement_period(
+                "Statement Period: February 30, 2025 - "
+                "March 23, 2025"
+            )
+
+    def test_capital_one_legacy_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_capital_one_statement_period(
+                "Statement Period: Nov 24 - "
+                "Dec 23, 2020"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2020, 11, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2020, 12, 23),
+        )
+
+    def test_capital_one_legacy_cross_year_period(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_capital_one_statement_period(
+                "Statement Period: Dec 24 - "
+                "Jan 23, 2021"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2020, 12, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2021, 1, 23),
+        )
+
+    def test_capital_one_modern_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_capital_one_statement_period(
+                "Statement Period: Dec 24, 2024 - "
+                "Jan 23, 2025"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2024, 12, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2025, 1, 23),
+        )
+
+    def test_missing_capital_one_period_returns_none(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        self.assertEqual(
+            processor._extract_capital_one_statement_period(
+                "No billing period is present."
+            ),
+            (None, None),
+        )
+
+    def test_invalid_capital_one_period_is_rejected(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        with self.assertRaisesRegex(
+            PDFProcessingError,
+            "Invalid Capital One Mastercard "
+            "statement-period date",
+        ):
+            processor._extract_capital_one_statement_period(
+                "Statement Period: February 30, 2025 - "
+                "March 23, 2025"
+            )
+
+    def test_capital_one_legacy_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_capital_one_statement_period(
+                "Statement Period: Nov 24 - "
+                "Dec 23, 2020"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2020, 11, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2020, 12, 23),
+        )
+
+    def test_capital_one_legacy_cross_year_period(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_capital_one_statement_period(
+                "Statement Period: Dec 24 - "
+                "Jan 23, 2021"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2020, 12, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2021, 1, 23),
+        )
+
+    def test_capital_one_modern_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_capital_one_statement_period(
+                "Statement Period: Dec 24, 2024 - "
+                "Jan 23, 2025"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2024, 12, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2025, 1, 23),
+        )
+
+    def test_missing_capital_one_period_returns_none(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        self.assertEqual(
+            processor._extract_capital_one_statement_period(
+                "No billing period is present."
+            ),
+            (None, None),
+        )
+
+    def test_invalid_capital_one_period_is_rejected(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        with self.assertRaisesRegex(
+            PDFProcessingError,
+            "Invalid Capital One Mastercard "
+            "statement-period date",
+        ):
+            processor._extract_capital_one_statement_period(
+                "Statement Period: February 30, 2025 - "
+                "March 23, 2025"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
