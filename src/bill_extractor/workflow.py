@@ -5,7 +5,9 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 
@@ -141,20 +143,114 @@ def _normalized_csv_path(
     )
 
 
-def _write_normalized_csv(
+def _raw_csv_path(
+    pdf_file: Path,
+    destination: Path,
+) -> Path:
+    return (
+        destination
+        / f"{pdf_file.stem}_transactions.csv"
+    )
+
+
+def _stage_csv(
     transactions: pd.DataFrame,
     output_path: Path,
-) -> None:
+) -> Path:
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    transactions.to_csv(
-        output_path,
-        index=False,
-        lineterminator="\n",
+    with NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="",
+        delete=False,
+        dir=output_path.parent,
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+    ) as temporary_file:
+        transactions.to_csv(
+            temporary_file,
+            index=False,
+            lineterminator="\n",
+        )
+
+        return Path(temporary_file.name)
+
+
+def _write_statement_csvs(
+    raw_transactions: pd.DataFrame,
+    raw_path: Path,
+    normalized_transactions: pd.DataFrame,
+    normalized_path: Path,
+) -> None:
+    targets = (
+        (
+            raw_transactions,
+            raw_path,
+        ),
+        (
+            normalized_transactions,
+            normalized_path,
+        ),
     )
+
+    staged: list[tuple[Path, Path]] = []
+    backups: dict[Path, Path] = {}
+    committed: set[Path] = set()
+
+    try:
+        for transactions, target in targets:
+            staged.append(
+                (
+                    _stage_csv(
+                        transactions,
+                        target,
+                    ),
+                    target,
+                )
+            )
+
+        for _, target in staged:
+            if not target.exists():
+                continue
+
+            backup = target.with_name(
+                f".{target.name}."
+                f"{uuid4().hex}.bak"
+            )
+
+            target.replace(backup)
+            backups[target] = backup
+
+        for temporary_path, target in staged:
+            temporary_path.replace(target)
+            committed.add(target)
+
+    except Exception:
+        for target in committed:
+            target.unlink(
+                missing_ok=True
+            )
+
+        for target, backup in backups.items():
+            if backup.exists():
+                backup.replace(target)
+
+        raise
+
+    finally:
+        for temporary_path, _ in staged:
+            temporary_path.unlink(
+                missing_ok=True
+            )
+
+        for backup in backups.values():
+            backup.unlink(
+                missing_ok=True
+            )
 
 
 def _profile_output_slug(
@@ -389,6 +485,13 @@ def run_extraction_workflow(
                         "statement metadata."
                     )
 
+                normalized = (
+                    normalize_transactions(
+                        result.transactions,
+                        result.metadata,
+                    )
+                )
+
                 destination = (
                     _statement_destination(
                         profile,
@@ -398,21 +501,10 @@ def run_extraction_workflow(
                     )
                 )
 
-                raw_csv = (
-                    processor.save_transactions(
-                        pdf_file,
-                        destination,
-                        result,
-                    )
+                raw_csv = _raw_csv_path(
+                    pdf_file,
+                    destination,
                 )
-
-                normalized = (
-                    normalize_transactions(
-                        result.transactions,
-                        result.metadata,
-                    )
-                )
-
                 normalized_csv = (
                     _normalized_csv_path(
                         pdf_file,
@@ -420,7 +512,9 @@ def run_extraction_workflow(
                     )
                 )
 
-                _write_normalized_csv(
+                _write_statement_csvs(
+                    result.transactions,
+                    raw_csv,
                     normalized,
                     normalized_csv,
                 )

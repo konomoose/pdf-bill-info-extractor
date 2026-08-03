@@ -308,6 +308,110 @@ class WorkflowTest(unittest.TestCase):
                 {2024, 2025},
             )
 
+    def test_normalization_failure_preserves_existing_outputs(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_root = root / "input"
+            output_root = (
+                root / "csv_output" / "test_bank"
+            )
+
+            pdf_file = (
+                input_root
+                / "2025"
+                / "statement.pdf"
+            )
+            pdf_file.parent.mkdir(
+                parents=True
+            )
+            pdf_file.touch()
+
+            profile = make_profile(
+                input_root,
+                output_root,
+                profile_id=(
+                    "capital_one_mastercard_v1"
+                ),
+                display_name="Test Card",
+            )
+
+            extraction = make_result(
+                pdf_file,
+                [
+                    {
+                        "Transaction date": "Mar 14",
+                        "Posting date": "Mar 15",
+                        "Description": "",
+                        "Amount": "10.00",
+                    }
+                ],
+                start=date(2025, 3, 1),
+                end=date(2025, 3, 31),
+            )
+
+            destination = (
+                output_root / "2025"
+            )
+            destination.mkdir(
+                parents=True
+            )
+
+            raw_csv = (
+                destination
+                / "statement_transactions.csv"
+            )
+            normalized_csv = (
+                destination
+                / (
+                    "statement_"
+                    "normalized_transactions.csv"
+                )
+            )
+
+            raw_csv.write_text(
+                "existing raw output\n",
+                encoding="utf-8",
+            )
+            normalized_csv.write_text(
+                "existing normalized output\n",
+                encoding="utf-8",
+            )
+
+            result = run_extraction_workflow(
+                [profile],
+                summary_root=(
+                    root / "csv_output"
+                ),
+                processor_factory=(
+                    make_processor_factory(
+                        {
+                            pdf_file.resolve(): (
+                                extraction
+                            )
+                        }
+                    )
+                ),
+            )
+
+            self.assertEqual(
+                result.failed_count,
+                1,
+            )
+            self.assertEqual(
+                raw_csv.read_text(
+                    encoding="utf-8"
+                ),
+                "existing raw output\n",
+            )
+            self.assertEqual(
+                normalized_csv.read_text(
+                    encoding="utf-8"
+                ),
+                "existing normalized output\n",
+            )
+
     def test_shared_output_root_is_combined_once(
         self,
     ) -> None:

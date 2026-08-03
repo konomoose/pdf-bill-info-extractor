@@ -213,6 +213,87 @@ def _normalize_related_date(
     return resolved.isoformat()
 
 
+def _resolve_row_dates(
+    source_row: pd.Series,
+    mapping: dict[str, str],
+    metadata: StatementMetadata,
+    row_number: int,
+) -> tuple[str, dict[str, str]]:
+    transaction_source_column = mapping[
+        "transaction_date"
+    ]
+    transaction_value = source_row[
+        transaction_source_column
+    ]
+
+    if _is_blank(transaction_value):
+        raise NormalizationError(
+            f"Row {row_number} has no transaction date."
+        )
+
+    try:
+        transaction_date = _normalize_date(
+            transaction_value,
+            metadata,
+        )
+    except NormalizationError as primary_error:
+        # Credit-card purchases can occur shortly before a
+        # statement period and post after that period begins.
+        # Recover only when a posting/effective date can itself
+        # be resolved inside the verified statement period.
+        for target_column in (
+            "posting_date",
+            "effective_date",
+        ):
+            source_column = mapping.get(
+                target_column
+            )
+
+            if source_column is None:
+                continue
+
+            related_value = source_row[
+                source_column
+            ]
+
+            if _is_blank(related_value):
+                continue
+
+            try:
+                related_anchor = (
+                    resolve_transaction_date(
+                        str(related_value),
+                        metadata,
+                    )
+                )
+                recovered_transaction = (
+                    resolve_related_date(
+                        str(transaction_value),
+                        related_anchor,
+                    )
+                )
+            except TransactionDateError:
+                continue
+
+            if recovered_transaction > related_anchor:
+                continue
+
+            return (
+                recovered_transaction.isoformat(),
+                {
+                    target_column: (
+                        related_anchor.isoformat()
+                    )
+                },
+            )
+
+        raise NormalizationError(
+            f"Row {row_number}: {primary_error}"
+        ) from primary_error
+
+    return transaction_date, {}
+
+
 def normalize_transactions(
     transactions: pd.DataFrame,
     metadata: StatementMetadata,
@@ -250,19 +331,15 @@ def normalize_transactions(
             for column in NORMALIZED_COLUMNS
         }
 
-        transaction_source_column = mapping[
-            "transaction_date"
-        ]
-
-        normalized["transaction_date"] = _normalize_date(
-            source_row[transaction_source_column],
+        (
+            normalized["transaction_date"],
+            resolved_secondary_dates,
+        ) = _resolve_row_dates(
+            source_row,
+            mapping,
             metadata,
+            row_number,
         )
-
-        if not normalized["transaction_date"]:
-            raise NormalizationError(
-                f"Row {row_number} has no transaction date."
-            )
 
         anchor_date = date.fromisoformat(
             normalized["transaction_date"]
@@ -275,12 +352,22 @@ def normalize_transactions(
             value = source_row[source_column]
 
             if target_column in _SECONDARY_DATE_FIELDS:
-                normalized[target_column] = (
-                    _normalize_related_date(
-                        value,
-                        anchor_date,
+                if (
+                    target_column
+                    in resolved_secondary_dates
+                ):
+                    normalized[target_column] = (
+                        resolved_secondary_dates[
+                            target_column
+                        ]
                     )
-                )
+                else:
+                    normalized[target_column] = (
+                        _normalize_related_date(
+                            value,
+                            anchor_date,
+                        )
+                    )
             elif target_column in _MONEY_FIELDS:
                 normalized[target_column] = _normalize_money(
                     value

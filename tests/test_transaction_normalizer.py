@@ -254,6 +254,44 @@ class TransactionNormalizerTest(unittest.TestCase):
             ["2025-12-31", "2026-01-05"],
         )
 
+    def test_credit_card_purchase_may_precede_period(
+        self,
+    ) -> None:
+        result = normalize_transactions(
+            pd.DataFrame(
+                [
+                    {
+                        "Trans date": "Nov 09",
+                        "Post date": "Nov 12",
+                        "Description": "Purchase",
+                        "Spend Categories": "General",
+                        "Amount($)": "10.00",
+                    }
+                ]
+            ),
+            make_metadata(
+                "simplii_visa_v1",
+                "credit_card_statement",
+                start=date(2024, 11, 11),
+                end=date(2024, 12, 10),
+            ),
+        )
+
+        self.assertEqual(
+            result.loc[
+                0,
+                "transaction_date",
+            ],
+            "2024-11-09",
+        )
+        self.assertEqual(
+            result.loc[
+                0,
+                "posting_date",
+            ],
+            "2024-11-12",
+        )
+
     def test_blank_directional_fields_remain_blank(self) -> None:
         result = normalize_transactions(
             pd.DataFrame(
