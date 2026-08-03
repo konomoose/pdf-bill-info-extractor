@@ -330,6 +330,83 @@ class ExtractionMetadataTest(unittest.TestCase):
                 "March 30, 2025"
             )
 
+    def test_cibc_visa_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_cibc_statement_period(
+                "Statement period February 24 - "
+                "March 23, 2024"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2024, 2, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2024, 3, 23),
+        )
+
+    def test_cibc_visa_cross_year_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_cibc_statement_period(
+                "Statement period December 20 - "
+                "January 19, 2025"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2024, 12, 20),
+        )
+        self.assertEqual(
+            end,
+            date(2025, 1, 19),
+        )
+
+    def test_missing_cibc_visa_period_returns_none(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        self.assertEqual(
+            processor._extract_cibc_statement_period(
+                "No billing dates are present."
+            ),
+            (None, None),
+        )
+
+    def test_invalid_cibc_visa_period_is_rejected(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        with self.assertRaisesRegex(
+            PDFProcessingError,
+            "Invalid CIBC/Simplii Visa "
+            "statement-period date",
+        ):
+            processor._extract_cibc_statement_period(
+                "Statement period February 30 - "
+                "March 23, 2024"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

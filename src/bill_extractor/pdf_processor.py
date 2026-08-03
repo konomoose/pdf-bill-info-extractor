@@ -26,6 +26,16 @@ MONTHS = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
 DATE_RE = re.compile(rf"^{MONTHS}\s+\d{{1,2}}$")
 AMOUNT_RE = re.compile(r"^-?\$?\d[\d,]*\.\d{2}(?:\*+)?$")
 
+CIBC_STATEMENT_PERIOD_RE = re.compile(
+    r"(?:statement|billing)\s+(?:period|from)\s*:?\s*"
+    r"([A-Za-z]+\s+\d{1,2})"
+    r"(?:(?:,\s*|\s+)(\d{4}))?\s*"
+    r"(?:-|to|through)\s*"
+    r"([A-Za-z]+\s+\d{1,2})"
+    r"(?:,\s*|\s+)(\d{4})",
+    re.IGNORECASE,
+)
+
 RBC_CHQ_DATE_RE = re.compile(
     rf"^(\d{{1,2}})\s+({MONTHS})$",
     re.IGNORECASE,
@@ -320,6 +330,102 @@ class VisaPDFProcessor:
         )
 
     # CIBC credit-card parser -------------------------------------------------
+
+    @staticmethod
+    def _extract_cibc_statement_period(
+        page_text: str,
+    ) -> tuple[date | None, date | None]:
+        normalized = VisaPDFProcessor._normalize_text(
+            page_text
+        )
+        match = CIBC_STATEMENT_PERIOD_RE.search(
+            normalized
+        )
+
+        if match is None:
+            return None, None
+
+        (
+            start_value,
+            start_year_value,
+            end_value,
+            end_year_value,
+        ) = match.groups()
+
+        def parse_month_day(
+            value: str,
+        ) -> tuple[int, int]:
+            cleaned = re.sub(
+                r"^Sept\b",
+                "Sep",
+                value,
+                flags=re.IGNORECASE,
+            )
+
+            for date_format in (
+                "%B %d %Y",
+                "%b %d %Y",
+            ):
+                try:
+                    parsed = datetime.strptime(
+                        f"{cleaned} 2000",
+                        date_format,
+                    )
+                    return parsed.month, parsed.day
+                except ValueError:
+                    continue
+
+            raise PDFProcessingError(
+                "Invalid CIBC/Simplii Visa "
+                "statement-period date: "
+                f"{value!r}."
+            )
+
+        start_month, start_day = parse_month_day(
+            start_value
+        )
+        end_month, end_day = parse_month_day(
+            end_value
+        )
+
+        end_year = int(end_year_value)
+        start_year = (
+            int(start_year_value)
+            if start_year_value is not None
+            else end_year
+        )
+
+        if (
+            start_year_value is None
+            and (start_month, start_day)
+            > (end_month, end_day)
+        ):
+            start_year -= 1
+
+        try:
+            statement_start = date(
+                start_year,
+                start_month,
+                start_day,
+            )
+            statement_end = date(
+                end_year,
+                end_month,
+                end_day,
+            )
+        except ValueError as exc:
+            raise PDFProcessingError(
+                "Invalid CIBC/Simplii Visa "
+                "statement-period date."
+            ) from exc
+
+        if statement_start > statement_end:
+            raise PDFProcessingError(
+                "CIBC/Simplii Visa statement-period "
+                "start date is later than its end date."
+            )
+
+        return statement_start, statement_end
 
     def _find_cibc_transaction_header(self, page: fitz.Page) -> dict | None:
         lines = self._group_words_into_lines(page.get_text("words"))
@@ -3067,6 +3173,8 @@ class VisaPDFProcessor:
         all_rows: list[dict[str, str]] = []
         source_pages: list[int] = []
         total_text_characters = 0
+        cibc_statement_start: date | None = None
+        cibc_statement_end: date | None = None
         simplii_total_out: Decimal | None = None
         simplii_total_in: Decimal | None = None
         simplii_statement_start: date | None = None
@@ -3110,7 +3218,47 @@ class VisaPDFProcessor:
                     total_text_characters += len(page_text.strip())
 
                     if self.profile.parser == "cibc_credit_card":
-                        page_rows = self._extract_cibc_page_transactions(page)
+                        (
+                            page_statement_start,
+                            page_statement_end,
+                        ) = self._extract_cibc_statement_period(
+                            page_text
+                        )
+
+                        if (
+                            page_statement_start is not None
+                            and page_statement_end is not None
+                        ):
+                            page_period = (
+                                page_statement_start,
+                                page_statement_end,
+                            )
+
+                            if cibc_statement_start is not None:
+                                current_period = (
+                                    cibc_statement_start,
+                                    cibc_statement_end,
+                                )
+
+                                if page_period != current_period:
+                                    raise PDFProcessingError(
+                                        "Conflicting CIBC/Simplii Visa "
+                                        "statement periods were found "
+                                        "in the PDF."
+                                    )
+
+                            cibc_statement_start = (
+                                page_statement_start
+                            )
+                            cibc_statement_end = (
+                                page_statement_end
+                            )
+
+                        page_rows = (
+                            self._extract_cibc_page_transactions(
+                                page
+                            )
+                        )
                     elif self.profile.parser == "triangle_mastercard":
                         page_rows = self._extract_triangle_page_transactions(page)
                     elif self.profile.parser == "capital_one_mastercard":
@@ -3460,6 +3608,26 @@ class VisaPDFProcessor:
             raise PDFProcessingError(
                 f"The PDF contains readable text, but no transaction table matching "
                 f"profile '{self.profile.display_name}' was found."
+            )
+
+        if self.profile.parser == "cibc_credit_card":
+            if (
+                cibc_statement_start is None
+                or cibc_statement_end is None
+            ):
+                raise PDFProcessingError(
+                    "CIBC/Simplii Visa statement period "
+                    "was not found. Transaction years "
+                    "cannot be resolved safely."
+                )
+
+            metadata = StatementMetadata(
+                source_file=metadata.source_file,
+                profile_id=metadata.profile_id,
+                institution=metadata.institution,
+                document_type=metadata.document_type,
+                statement_start_date=cibc_statement_start,
+                statement_end_date=cibc_statement_end,
             )
 
         if self.profile.parser == "simplii_chequing_account":

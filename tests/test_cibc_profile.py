@@ -3,12 +3,16 @@ from __future__ import annotations
 import hashlib
 import os
 import unittest
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 
 from src.bill_extractor.pdf_processor import VisaPDFProcessor
 from src.bill_extractor.profile_loader import load_profile
+from src.bill_extractor.transaction_normalizer import (
+    normalize_transactions,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = PROJECT_ROOT / "config" / "profiles" / "cibc_credit_card.json"
@@ -123,6 +127,40 @@ class CIBCCreditCardProfileTest(unittest.TestCase):
             actual,
             reference.reset_index(drop=True),
             check_dtype=False,
+        )
+
+    def test_statement_metadata_period(self) -> None:
+        self.assertIsNotNone(self.result.metadata)
+        self.assertEqual(
+            self.result.metadata.statement_start_date,
+            date(2024, 2, 24),
+        )
+        self.assertEqual(
+            self.result.metadata.statement_end_date,
+            date(2024, 3, 23),
+        )
+
+    def test_normalized_transaction_dates(self) -> None:
+        normalized = normalize_transactions(
+            self.result.transactions,
+            self.result.metadata,
+        )
+
+        self.assertEqual(
+            normalized.iloc[0]["transaction_date"],
+            "2024-02-24",
+        )
+        self.assertEqual(
+            normalized.iloc[0]["posting_date"],
+            "2024-02-26",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["transaction_date"],
+            "2024-03-19",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["posting_date"],
+            "2024-03-20",
         )
 
     def test_creditsmart_report_is_not_included(self) -> None:

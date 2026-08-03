@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from datetime import date
 from pathlib import Path
 
 from src.bill_extractor.pdf_processor import VisaPDFProcessor
 from src.bill_extractor.profile_loader import load_profile
+from src.bill_extractor.transaction_normalizer import (
+    normalize_transactions,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +81,56 @@ class SimpliiVisaProfileTest(unittest.TestCase):
         self.assertEqual(
             result.transactions.iloc[0]["Spend Categories"],
             "",
+        )
+
+    def test_old_layout_statement_metadata_period(
+        self,
+    ) -> None:
+        if not OLD_LAYOUT_PDF.is_file():
+            self.skipTest(
+                "Local Simplii Visa 2024 regression "
+                "statement not available."
+            )
+
+        result = VisaPDFProcessor(
+            profile=self.profile
+        ).extract_transactions(OLD_LAYOUT_PDF)
+
+        self.assertIsNotNone(result.metadata)
+        self.assertEqual(
+            result.metadata.statement_start_date,
+            date(2024, 5, 11),
+        )
+        self.assertEqual(
+            result.metadata.statement_end_date,
+            date(2024, 6, 10),
+        )
+
+    def test_old_layout_normalized_transaction_dates(
+        self,
+    ) -> None:
+        if not OLD_LAYOUT_PDF.is_file():
+            self.skipTest(
+                "Local Simplii Visa 2024 regression "
+                "statement not available."
+            )
+
+        result = VisaPDFProcessor(
+            profile=self.profile
+        ).extract_transactions(OLD_LAYOUT_PDF)
+
+        normalized = normalize_transactions(
+            result.transactions,
+            result.metadata,
+        )
+
+        self.assertEqual(
+            normalized.iloc[0]["transaction_date"],
+            "2024-05-16",
+        )
+        self.assertEqual(
+            normalized.iloc[0]["posting_date"],
+            "2024-05-17",
         )
 
 
