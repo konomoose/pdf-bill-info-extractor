@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 import fitz
@@ -9,6 +10,9 @@ import pandas as pd
 
 from src.bill_extractor.pdf_processor import PDFProcessingError, VisaPDFProcessor
 from src.bill_extractor.profile_loader import load_profile
+from src.bill_extractor.transaction_normalizer import (
+    normalize_transactions,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = PROJECT_ROOT / "config" / "profiles" / "td_visa_credit_card.json"
@@ -236,6 +240,40 @@ class TDVisaProfileTest(unittest.TestCase):
         self.assertEqual(last["Posting date"], "Sep 19")
         self.assertEqual(last["Activity description"], "RETAIL INTEREST")
         self.assertEqual(last["Amount($)"], "287.93")
+
+    def test_statement_metadata_period(self) -> None:
+        self.assertIsNotNone(self.result.metadata)
+        self.assertEqual(
+            self.result.metadata.statement_start_date,
+            date(2025, 8, 20),
+        )
+        self.assertEqual(
+            self.result.metadata.statement_end_date,
+            date(2025, 9, 19),
+        )
+
+    def test_normalized_transaction_dates(self) -> None:
+        normalized = normalize_transactions(
+            self.result.transactions,
+            self.result.metadata,
+        )
+
+        self.assertEqual(
+            normalized.iloc[0]["transaction_date"],
+            "2025-09-03",
+        )
+        self.assertEqual(
+            normalized.iloc[0]["posting_date"],
+            "2025-09-04",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["transaction_date"],
+            "2025-09-19",
+        )
+        self.assertEqual(
+            normalized.iloc[-1]["posting_date"],
+            "2025-09-19",
+        )
 
     def test_candidate_csv_is_created(self) -> None:
         self.assertTrue(self.output_csv.is_file())

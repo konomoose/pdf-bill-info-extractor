@@ -119,6 +119,13 @@ TD_NEW_BALANCE_RE = re.compile(
     r"total\s+new\s+balance\s+\$?([\d,]+\.\d{2})",
     re.IGNORECASE,
 )
+TD_STATEMENT_PERIOD_RE = re.compile(
+    r"(?:statement|billing)\s+(?:period|from)\s*:?\s*"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s*"
+    r"(?:-|to|through)\s*"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
 
 RBC_LOC_PRINCIPAL_BALANCE_RE = re.compile(
     r"Principal\s+balance\s+on\s+"
@@ -1820,6 +1827,55 @@ class VisaPDFProcessor:
 
         return rows
 
+    @staticmethod
+    def _extract_td_statement_period(
+        page_text: str,
+    ) -> tuple[date | None, date | None]:
+        normalized = VisaPDFProcessor._normalize_text(
+            page_text
+        )
+        match = TD_STATEMENT_PERIOD_RE.search(
+            normalized
+        )
+
+        if match is None:
+            return None, None
+
+        parsed_dates: list[date] = []
+
+        for value in match.groups():
+            parsed_date: date | None = None
+
+            for date_format in (
+                "%B %d, %Y",
+                "%b %d, %Y",
+            ):
+                try:
+                    parsed_date = datetime.strptime(
+                        value,
+                        date_format,
+                    ).date()
+                    break
+                except ValueError:
+                    continue
+
+            if parsed_date is None:
+                raise PDFProcessingError(
+                    "Invalid TD Visa statement-period date: "
+                    f"{value!r}."
+                )
+
+            parsed_dates.append(parsed_date)
+
+        statement_start, statement_end = parsed_dates
+
+        if statement_start > statement_end:
+            raise PDFProcessingError(
+                "TD Visa statement-period start date is "
+                "later than its end date."
+            )
+
+        return statement_start, statement_end
 
     def _extract_td_statement_balances(
         self,
@@ -3017,6 +3073,8 @@ class VisaPDFProcessor:
         simplii_statement_end: date | None = None
         td_previous_balance: Decimal | None = None
         td_new_balance: Decimal | None = None
+        td_statement_start: date | None = None
+        td_statement_end: date | None = None
         rbc_previous_balance: Decimal | None = None
         rbc_total_balance: Decimal | None = None
         rbc_visa_statement_start: date | None = None
@@ -3133,6 +3191,41 @@ class VisaPDFProcessor:
                             )
                         )
                     elif self.profile.parser == "td_visa_credit_card":
+                        (
+                            page_statement_start,
+                            page_statement_end,
+                        ) = self._extract_td_statement_period(
+                            page_text
+                        )
+
+                        if (
+                            page_statement_start is not None
+                            and page_statement_end is not None
+                        ):
+                            page_period = (
+                                page_statement_start,
+                                page_statement_end,
+                            )
+
+                            if td_statement_start is not None:
+                                current_period = (
+                                    td_statement_start,
+                                    td_statement_end,
+                                )
+
+                                if page_period != current_period:
+                                    raise PDFProcessingError(
+                                        "Conflicting TD Visa statement "
+                                        "periods were found in the PDF."
+                                    )
+
+                            td_statement_start = (
+                                page_statement_start
+                            )
+                            td_statement_end = (
+                                page_statement_end
+                            )
+
                         (
                             page_previous_balance,
                             page_new_balance,
@@ -3386,6 +3479,25 @@ class VisaPDFProcessor:
                 document_type=metadata.document_type,
                 statement_start_date=simplii_statement_start,
                 statement_end_date=simplii_statement_end,
+            )
+
+        if self.profile.parser == "td_visa_credit_card":
+            if (
+                td_statement_start is None
+                or td_statement_end is None
+            ):
+                raise PDFProcessingError(
+                    "TD Visa statement period was not found. "
+                    "Transaction years cannot be resolved safely."
+                )
+
+            metadata = StatementMetadata(
+                source_file=metadata.source_file,
+                profile_id=metadata.profile_id,
+                institution=metadata.institution,
+                document_type=metadata.document_type,
+                statement_start_date=td_statement_start,
+                statement_end_date=td_statement_end,
             )
 
         if self.profile.parser == "rbc_visa_credit_card":

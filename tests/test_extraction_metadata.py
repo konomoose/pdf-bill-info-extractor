@@ -277,6 +277,59 @@ class ExtractionMetadataTest(unittest.TestCase):
                 "MAR 30, 2025"
             )
 
+    def test_td_visa_period_is_parsed(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_td_statement_period(
+                "Statement from August 20, 2025 to "
+                "September 19, 2025"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2025, 8, 20),
+        )
+        self.assertEqual(
+            end,
+            date(2025, 9, 19),
+        )
+
+    def test_missing_td_visa_period_returns_none(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        self.assertEqual(
+            processor._extract_td_statement_period(
+                "No statement period is present."
+            ),
+            (None, None),
+        )
+
+    def test_invalid_td_visa_period_is_rejected(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        with self.assertRaisesRegex(
+            PDFProcessingError,
+            "Invalid TD Visa statement-period date",
+        ):
+            processor._extract_td_statement_period(
+                "Statement from February 30, 2025 to "
+                "March 30, 2025"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
