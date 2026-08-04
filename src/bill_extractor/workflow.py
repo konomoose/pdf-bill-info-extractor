@@ -171,6 +171,183 @@ def _load_normalized_statement_frames(
     return frames
 
 
+def _raw_csv_for_normalized(
+    normalized_csv: Path,
+) -> Path:
+    suffix = "_normalized_transactions.csv"
+
+    if not normalized_csv.name.endswith(
+        suffix
+    ):
+        raise WorkflowError(
+            "Normalized statement CSV has an "
+            f"unexpected name: {normalized_csv}"
+        )
+
+    statement_name = (
+        normalized_csv.name[
+            : -len(suffix)
+        ]
+    )
+
+    return normalized_csv.with_name(
+        f"{statement_name}_transactions.csv"
+    )
+
+
+def _normalized_csv_profile_ids(
+    normalized_csv: Path,
+) -> set[str]:
+    try:
+        frame = pd.read_csv(
+            normalized_csv,
+            dtype=str,
+            keep_default_na=False,
+            usecols=["profile_id"],
+        )
+
+    except (
+        OSError,
+        ValueError,
+        pd.errors.EmptyDataError,
+        pd.errors.ParserError,
+    ):
+        # Do not remove files that cannot be confidently
+        # attributed to this profile.
+        return set()
+
+    return {
+        str(value).strip()
+        for value in frame["profile_id"]
+        if str(value).strip()
+    }
+
+
+def _remove_statement_files(
+    paths: Iterable[Path],
+) -> None:
+    existing_paths = sorted(
+        {
+            path.resolve()
+            for path in paths
+            if path.exists()
+        },
+        key=lambda path: str(path).casefold(),
+    )
+
+    backups: dict[Path, Path] = {}
+
+    try:
+        for target in existing_paths:
+            backup = target.with_name(
+                f".{target.name}."
+                f"{uuid4().hex}.bak"
+            )
+
+            target.replace(backup)
+            backups[target] = backup
+
+    except Exception as exc:
+        restoration_errors: list[str] = []
+
+        for target, backup in backups.items():
+            if not backup.exists():
+                continue
+
+            try:
+                backup.replace(target)
+            except OSError as restore_exc:
+                restoration_errors.append(
+                    f"{target}: {restore_exc}"
+                )
+
+        if restoration_errors:
+            raise WorkflowError(
+                "Could not restore statement outputs "
+                "after cleanup failed: "
+                + "; ".join(restoration_errors)
+            ) from exc
+
+        raise WorkflowError(
+            "Could not remove stale statement "
+            f"outputs: {exc}"
+        ) from exc
+
+    cleanup_errors: list[str] = []
+
+    for backup in backups.values():
+        try:
+            backup.unlink(
+                missing_ok=True
+            )
+        except OSError as exc:
+            cleanup_errors.append(
+                f"{backup}: {exc}"
+            )
+
+    if cleanup_errors:
+        raise WorkflowError(
+            "Stale statement outputs were removed, "
+            "but backup files could not be deleted: "
+            + "; ".join(cleanup_errors)
+        )
+
+
+def _remove_stale_statement_outputs(
+    output_root: Path,
+    profile_id: str,
+    protected_normalized_paths: set[Path],
+) -> int:
+    protected = {
+        path.resolve()
+        for path in protected_normalized_paths
+    }
+
+    stale_normalized: list[Path] = []
+
+    for normalized_csv in sorted(
+        output_root.rglob(
+            "*_normalized_transactions.csv"
+        ),
+        key=lambda path: str(path).casefold(),
+    ):
+        if normalized_csv.resolve() in protected:
+            continue
+
+        profile_ids = (
+            _normalized_csv_profile_ids(
+                normalized_csv
+            )
+        )
+
+        if profile_ids != {profile_id}:
+            continue
+
+        stale_normalized.append(
+            normalized_csv
+        )
+
+    files_to_remove: set[Path] = set()
+
+    for normalized_csv in stale_normalized:
+        files_to_remove.add(
+            normalized_csv
+        )
+
+        raw_csv = _raw_csv_for_normalized(
+            normalized_csv
+        )
+
+        if raw_csv.exists():
+            files_to_remove.add(raw_csv)
+
+    _remove_statement_files(
+        files_to_remove
+    )
+
+    return len(stale_normalized)
+
+
 def _statement_destination(
     profile: ExtractionProfile,
     pdf_file: Path,
@@ -503,7 +680,12 @@ def run_extraction_workflow(
 
     file_results: list[WorkflowFileResult] = []
 
-    successful_output_roots: set[Path] = set()
+    consolidation_output_roots: set[Path] = set()
+
+    complete_scan_protected: dict[
+        tuple[Path, str],
+        set[Path],
+    ] = {}
 
     grouped_slugs: dict[Path, str] = {}
 
@@ -582,6 +764,20 @@ def run_extraction_workflow(
                 source_folder,
             )
 
+        cleanup_key = (
+            output_key,
+            profile.profile_id,
+        )
+
+        protected_normalized_paths = (
+            complete_scan_protected.setdefault(
+                cleanup_key,
+                set(),
+            )
+            if explicit_pdf_files is None
+            else set()
+        )
+
         if not pdf_files:
             file_results.append(
                 WorkflowFileResult(
@@ -599,9 +795,34 @@ def run_extraction_workflow(
                     ),
                 )
             )
+
             continue
 
         for pdf_file in pdf_files:
+            destination = (
+                _statement_destination(
+                    profile,
+                    pdf_file,
+                    source_folder,
+                    output_root,
+                )
+            )
+
+            expected_raw_csv = _raw_csv_path(
+                pdf_file,
+                destination,
+            )
+            expected_normalized_csv = (
+                _normalized_csv_path(
+                    pdf_file,
+                    destination,
+                )
+            )
+
+            protected_normalized_paths.add(
+                expected_normalized_csv.resolve()
+            )
+
             raw_csv: Path | None = None
             normalized_csv: Path | None = None
 
@@ -614,6 +835,10 @@ def run_extraction_workflow(
                 )
 
                 if skip_reason is not None:
+                    protected_normalized_paths.discard(
+                        expected_normalized_csv.resolve()
+                    )
+
                     file_results.append(
                         WorkflowFileResult(
                             profile_id=(
@@ -652,24 +877,9 @@ def run_extraction_workflow(
                     )
                 )
 
-                destination = (
-                    _statement_destination(
-                        profile,
-                        pdf_file,
-                        source_folder,
-                        output_root,
-                    )
-                )
-
-                raw_csv = _raw_csv_path(
-                    pdf_file,
-                    destination,
-                )
+                raw_csv = expected_raw_csv
                 normalized_csv = (
-                    _normalized_csv_path(
-                        pdf_file,
-                        destination,
-                    )
+                    expected_normalized_csv
                 )
 
                 _write_statement_csvs(
@@ -679,7 +889,7 @@ def run_extraction_workflow(
                     normalized_csv,
                 )
 
-                successful_output_roots.add(
+                consolidation_output_roots.add(
                     output_key
                 )
 
@@ -746,10 +956,37 @@ def run_extraction_workflow(
                     )
                 )
 
+    # Cleanup happens only after all complete profile scans have
+    # contributed their protected statement paths. This prevents one
+    # profile from removing outputs produced by another profile that
+    # shares the same output root and profile ID.
+    for (
+        output_root,
+        profile_id,
+    ), protected_paths in sorted(
+        complete_scan_protected.items(),
+        key=lambda item: (
+            str(item[0][0]).casefold(),
+            item[0][1].casefold(),
+        ),
+    ):
+        removed_count = (
+            _remove_stale_statement_outputs(
+                output_root,
+                profile_id,
+                protected_paths,
+            )
+        )
+
+        if removed_count:
+            consolidation_output_roots.add(
+                output_root
+            )
+
     yearly_outputs: list[YearlyOutput] = []
 
     for output_root in sorted(
-        successful_output_roots,
+        consolidation_output_roots,
         key=lambda path: str(path).casefold(),
     ):
         frames = (
@@ -758,9 +995,6 @@ def run_extraction_workflow(
             )
         )
         slug = grouped_slugs[output_root]
-
-        if not frames:
-            continue
 
         try:
             yearly_frames = (

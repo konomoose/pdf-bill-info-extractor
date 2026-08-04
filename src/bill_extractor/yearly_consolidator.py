@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 import re
+from tempfile import NamedTemporaryFile
+from uuid import uuid4
 
 import pandas as pd
 
@@ -207,6 +209,196 @@ def consolidate_normalized_transactions(
     return yearly
 
 
+def _managed_yearly_csv_paths(
+    output_root: Path,
+    institution_slug: str,
+) -> set[Path]:
+    """
+    Find yearly CSVs managed by this institution slug.
+
+    Unrelated CSVs and statement-level CSVs are not included.
+    """
+    name_pattern = re.compile(
+        rf"^{re.escape(institution_slug)}_"
+        r"(?P<year>\d{4})_transactions\.csv$"
+    )
+
+    managed: set[Path] = set()
+
+    for csv_path in output_root.glob(
+        f"????/{institution_slug}_"
+        "????_transactions.csv"
+    ):
+        match = name_pattern.fullmatch(
+            csv_path.name
+        )
+
+        if (
+            match is None
+            or match.group("year")
+            != csv_path.parent.name
+            or not csv_path.is_file()
+        ):
+            continue
+
+        managed.add(csv_path)
+
+    return managed
+
+
+def _stage_yearly_csv(
+    transactions: pd.DataFrame,
+    output_path: Path,
+) -> Path:
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_path: Path | None = None
+
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            delete=False,
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+        ) as temporary_file:
+            temporary_path = Path(
+                temporary_file.name
+            )
+
+            transactions.to_csv(
+                temporary_file,
+                index=False,
+                lineterminator="\n",
+            )
+
+        return temporary_path
+
+    except Exception:
+        if temporary_path is not None:
+            temporary_path.unlink(
+                missing_ok=True
+            )
+
+        raise
+
+
+def _commit_yearly_outputs(
+    staged: dict[Path, Path],
+    stale_paths: set[Path],
+) -> None:
+    """
+    Replace all current yearly outputs as one recoverable operation.
+
+    Existing target and stale files are first moved to backups.
+    They are restored if any replacement fails.
+    """
+    affected_paths = (
+        set(staged)
+        | stale_paths
+    )
+
+    backups: dict[Path, Path] = {}
+    committed: set[Path] = set()
+
+    try:
+        for target in sorted(
+            affected_paths,
+            key=lambda path: str(path).casefold(),
+        ):
+            if not target.exists():
+                continue
+
+            backup = target.with_name(
+                f".{target.name}."
+                f"{uuid4().hex}.bak"
+            )
+
+            target.replace(backup)
+            backups[target] = backup
+
+        for target in sorted(
+            staged,
+            key=lambda path: str(path).casefold(),
+        ):
+            staged[target].replace(target)
+            committed.add(target)
+
+    except Exception as exc:
+        restoration_errors: list[str] = []
+
+        # New files with no previous version must disappear.
+        for target in committed:
+            if target in backups:
+                continue
+
+            try:
+                target.unlink(
+                    missing_ok=True
+                )
+            except OSError as restore_exc:
+                restoration_errors.append(
+                    f"{target}: {restore_exc}"
+                )
+
+        # Existing and stale files return to their old paths.
+        for target, backup in backups.items():
+            if not backup.exists():
+                continue
+
+            try:
+                backup.replace(target)
+            except OSError as restore_exc:
+                restoration_errors.append(
+                    f"{target}: {restore_exc}"
+                )
+
+        if restoration_errors:
+            preserved_backups = [
+                str(backup)
+                for backup in backups.values()
+                if backup.exists()
+            ]
+
+            details = "; ".join(
+                restoration_errors
+            )
+
+            backup_details = (
+                ", ".join(preserved_backups)
+                if preserved_backups
+                else "none"
+            )
+
+            raise ConsolidationError(
+                "Could not restore previous yearly "
+                f"outputs: {details}. "
+                "Preserved backup files: "
+                f"{backup_details}."
+            ) from exc
+
+        raise
+
+    else:
+        # On success, deleting the backups also removes stale
+        # yearly outputs that are no longer represented.
+        for backup in backups.values():
+            backup.unlink(
+                missing_ok=True
+            )
+
+    finally:
+        for temporary_path in staged.values():
+            temporary_path.unlink(
+                missing_ok=True
+            )
+
+
 def write_yearly_transaction_csvs(
     frames: Iterable[pd.DataFrame],
     *,
@@ -216,10 +408,13 @@ def write_yearly_transaction_csvs(
     """
     Write one consolidated CSV per transaction year.
 
+    Existing managed yearly files are replaced atomically.
+    Managed years no longer present in the input are removed.
+    Unrelated files remain untouched.
+
     Example:
         csv_output/cibc/2025/cibc_2025_transactions.csv
     """
-
     if not _INSTITUTION_SLUG_RE.fullmatch(
         institution_slug
     ):
@@ -229,32 +424,55 @@ def write_yearly_transaction_csvs(
         )
 
     root = Path(output_root)
+
     yearly = consolidate_normalized_transactions(
         frames
     )
-    written: dict[int, Path] = {}
 
-    for year, transactions in yearly.items():
-        year_folder = root / str(year)
-        year_folder.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        output_path = (
-            year_folder
+    targets = {
+        year: (
+            root
+            / str(year)
             / (
                 f"{institution_slug}_{year}"
                 "_transactions.csv"
             )
         )
+        for year in yearly
+    }
 
-        transactions.to_csv(
-            output_path,
-            index=False,
-            lineterminator="\n",
+    staged: dict[Path, Path] = {}
+
+    try:
+        for year, target in targets.items():
+            staged[target] = _stage_yearly_csv(
+                yearly[year],
+                target,
+            )
+
+    except Exception:
+        for temporary_path in staged.values():
+            temporary_path.unlink(
+                missing_ok=True
+            )
+
+        raise
+
+    existing_managed = (
+        _managed_yearly_csv_paths(
+            root,
+            institution_slug,
         )
+    )
 
-        written[year] = output_path
+    stale_paths = (
+        existing_managed
+        - set(targets.values())
+    )
 
-    return written
+    _commit_yearly_outputs(
+        staged,
+        stale_paths,
+    )
+
+    return targets
