@@ -445,12 +445,14 @@ def run_extraction_workflow(
             normalized_csv: Path | None = None
 
             try:
-                if (
+                skip_reason = (
                     processor
-                    ._is_rbc_loc_annual_summary(
+                    .non_transaction_document_reason(
                         pdf_file
                     )
-                ):
+                )
+
+                if skip_reason is not None:
                     file_results.append(
                         WorkflowFileResult(
                             profile_id=(
@@ -465,10 +467,7 @@ def run_extraction_workflow(
                             source_pages=(),
                             raw_csv=None,
                             normalized_csv=None,
-                            error=(
-                                "Annual RBC LOC summary; "
-                                "no transaction table."
-                            ),
+                            error=skip_reason,
                         )
                     )
                     continue

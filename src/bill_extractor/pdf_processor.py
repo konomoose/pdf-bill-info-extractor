@@ -60,8 +60,11 @@ RBC_TOTAL_BALANCE_RE = re.compile(
 )
 RBC_VISA_STATEMENT_PERIOD_RE = re.compile(
     r"Statement\s+(?:period|from)\s*:?\s*"
-    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s*(?:-|to|through)\s*"
-    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+    r"([A-Za-z]+\s+\d{1,2})"
+    r"(?:(?:,\s*|\s+)(\d{4}))?\s*"
+    r"(?:-|to|through)\s*"
+    r"([A-Za-z]+\s+\d{1,2})"
+    r"(?:,\s*|\s+)(\d{4})",
     re.IGNORECASE,
 )
 
@@ -2234,9 +2237,15 @@ class VisaPDFProcessor:
         """Normalize RBC dates such as DEC 14 and JAN 04."""
         return f"{month.title()} {int(day)}"
 
-    def _find_rbc_transaction_header(self, page: fitz.Page) -> dict | None:
-        """Locate RBC's four-column transaction heading."""
-        lines = self._group_words_into_lines(page.get_text("words"))
+    def _find_rbc_transaction_header(
+        self,
+        page: fitz.Page,
+    ) -> dict | None:
+        """Locate the topmost valid RBC transaction heading."""
+        lines = self._group_words_into_lines(
+            page.get_text("words")
+        )
+
         required_tokens = {
             "transaction",
             "posting",
@@ -2246,95 +2255,179 @@ class VisaPDFProcessor:
             "date",
         }
 
-        # RBC spreads the heading over several closely spaced visual lines.
+        candidates: list[dict] = []
+
+        # RBC can split the first heading across several
+        # lines while printing a later heading on one line.
+        # Collect every valid candidate before selecting one.
         for window_size in range(1, 6):
-            for index in range(0, len(lines) - window_size + 1):
-                nearby_lines = lines[index : index + window_size]
+            for index in range(
+                0,
+                len(lines) - window_size + 1,
+            ):
+                nearby_lines = lines[
+                    index : index + window_size
+                ]
+
                 nearby_words = [
                     word
                     for nearby_line in nearby_lines
                     for word in nearby_line["words"]
                 ]
-                nearby_text = " ".join(
-                    str(word[4]) for word in nearby_words
-                ).lower()
-                tokens = set(re.findall(r"[a-z]+", nearby_text))
 
-                if not required_tokens.issubset(tokens):
+                nearby_text = " ".join(
+                    str(word[4])
+                    for word in nearby_words
+                ).lower()
+
+                tokens = set(
+                    re.findall(
+                        r"[a-z]+",
+                        nearby_text,
+                    )
+                )
+
+                if not required_tokens.issubset(
+                    tokens
+                ):
                     continue
 
                 transaction = next(
                     (
                         word
                         for word in nearby_words
-                        if str(word[4]).lower() == "transaction"
+                        if str(word[4]).lower()
+                        == "transaction"
                     ),
                     None,
                 )
+
                 posting = next(
                     (
                         word
                         for word in nearby_words
-                        if str(word[4]).lower() == "posting"
+                        if str(word[4]).lower()
+                        == "posting"
                     ),
                     None,
                 )
+
                 amount = next(
                     (
                         word
                         for word in nearby_words
-                        if str(word[4]).lower().replace(" ", "")
-                        in {"amount", "amount($)"}
+                        if str(word[4])
+                        .lower()
+                        .replace(" ", "")
+                        in {
+                            "amount",
+                            "amount($)",
+                        }
                     ),
                     None,
                 )
 
-                if not all((transaction, posting, amount)):
+                if not all(
+                    (
+                        transaction,
+                        posting,
+                        amount,
+                    )
+                ):
                     continue
 
                 if not (
-                    transaction[0] < posting[0] < amount[0]
+                    transaction[0]
+                    < posting[0]
+                    < amount[0]
                 ):
                     continue
 
                 amount_words = [
                     word
                     for word in nearby_words
-                    if str(word[4]).lower().replace(" ", "")
-                    in {"amount", "amount($)", "($)"}
+                    if str(word[4])
+                    .lower()
+                    .replace(" ", "")
+                    in {
+                        "amount",
+                        "amount($)",
+                        "($)",
+                    }
                 ]
 
-                table_right = max(word[2] for word in amount_words) + 4.0
+                table_right = (
+                    max(
+                        word[2]
+                        for word in amount_words
+                    )
+                    + 4.0
+                )
 
                 table_header_words = [
                     word
                     for word in nearby_words
-                    if self._word_center_x(word) < table_right
+                    if (
+                        self._word_center_x(word)
+                        < table_right
+                    )
                 ]
 
-                return {
-                    "right": table_right,
-                    "bottom": max(word[3] for word in table_header_words),
-                }
+                candidates.append(
+                    {
+                        "right": table_right,
+                        "top": min(
+                            word[1]
+                            for word
+                            in table_header_words
+                        ),
+                        "bottom": max(
+                            word[3]
+                            for word
+                            in table_header_words
+                        ),
+                        "window_size": window_size,
+                    }
+                )
 
-        return None
+        if not candidates:
+            return None
+
+        # Several overlapping windows can describe the same
+        # visual heading. Top position is decisive; the
+        # smallest window breaks ties.
+        chosen = min(
+            candidates,
+            key=lambda item: (
+                item["top"],
+                item["bottom"],
+                item["window_size"],
+            ),
+        )
+
+        return {
+            "right": chosen["right"],
+            "bottom": chosen["bottom"],
+        }
 
     def _extract_rbc_page_transactions(
         self,
         page: fitz.Page,
     ) -> list[dict[str, str]]:
         page_text = page.get_text("text")
+        header = self._find_rbc_transaction_header(
+            page
+        )
 
-        if self._page_is_excluded(page_text):
-            logger.info(
-                "Ignoring excluded report page %s for profile %s.",
-                page.number + 1,
-                self.profile.profile_id,
-            )
-            return []
-
-        header = self._find_rbc_transaction_header(page)
         if header is None:
+            if self._page_is_excluded(page_text):
+                logger.info(
+                    "Ignoring excluded report page %s "
+                    "for profile %s.",
+                    page.number + 1,
+                    self.profile.profile_id,
+                )
+
             return []
 
         # RBC places account/rewards information to the right of the
@@ -2367,7 +2460,13 @@ class VisaPDFProcessor:
                 continue
 
             if "subtotal of monthly activity" in line_text.lower():
-                break
+                # An RBC statement can contain more than one card or
+                # activity section on the same page. Finish the current
+                # section, then continue looking for later transaction rows.
+                current_row = None
+                last_row_y = None
+                table_started = False
+                continue
 
             row_match = RBC_ROW_RE.fullmatch(line_text)
 
@@ -2452,33 +2551,77 @@ class VisaPDFProcessor:
         if match is None:
             return None, None
 
-        parsed_dates: list[date] = []
+        (
+            start_value,
+            start_year_value,
+            end_value,
+            end_year_value,
+        ) = match.groups()
 
-        for value in match.groups():
-            parsed_date: date | None = None
+        def parse_month_day(
+            value: str,
+        ) -> tuple[int, int]:
+            cleaned = re.sub(
+                r"^Sept\b",
+                "Sep",
+                value,
+                flags=re.IGNORECASE,
+            )
 
             for date_format in (
-                "%B %d, %Y",
-                "%b %d, %Y",
+                "%B %d %Y",
+                "%b %d %Y",
             ):
                 try:
-                    parsed_date = datetime.strptime(
-                        value,
+                    parsed = datetime.strptime(
+                        f"{cleaned} 2000",
                         date_format,
-                    ).date()
-                    break
+                    )
+                    return parsed.month, parsed.day
                 except ValueError:
                     continue
 
-            if parsed_date is None:
-                raise PDFProcessingError(
-                    "Invalid RBC Visa statement-period date: "
-                    f"{value!r}."
-                )
+            raise PDFProcessingError(
+                "Invalid RBC Visa statement-period date: "
+                f"{value!r}."
+            )
 
-            parsed_dates.append(parsed_date)
+        start_month, start_day = parse_month_day(
+            start_value
+        )
+        end_month, end_day = parse_month_day(
+            end_value
+        )
 
-        statement_start, statement_end = parsed_dates
+        end_year = int(end_year_value)
+        start_year = (
+            int(start_year_value)
+            if start_year_value is not None
+            else end_year
+        )
+
+        if (
+            start_year_value is None
+            and (start_month, start_day)
+            > (end_month, end_day)
+        ):
+            start_year -= 1
+
+        try:
+            statement_start = date(
+                start_year,
+                start_month,
+                start_day,
+            )
+            statement_end = date(
+                end_year,
+                end_month,
+                end_day,
+            )
+        except ValueError as exc:
+            raise PDFProcessingError(
+                "Invalid RBC Visa statement-period date."
+            ) from exc
 
         if statement_start > statement_end:
             raise PDFProcessingError(
@@ -4509,6 +4652,81 @@ class VisaPDFProcessor:
         csv_path = self.save_transactions(pdf_path, output_folder, result)
         return result, csv_path
 
+    def _is_simplii_annual_summary(
+        self,
+        pdf_path: str | Path,
+    ) -> bool:
+        """
+        Return True only for the known Simplii annual
+        interest-and-fee summary without an activity table.
+        """
+        if (
+            self.profile.parser
+            != "simplii_chequing_account"
+        ):
+            return False
+
+        text_parts: list[str] = []
+        has_transaction_header = False
+
+        with fitz.open(pdf_path) as document:
+            for page in document:
+                text_parts.append(
+                    page.get_text("text")
+                )
+
+                if (
+                    self._find_simplii_transaction_header(
+                        page
+                    )
+                    is not None
+                ):
+                    has_transaction_header = True
+
+        if has_transaction_header:
+            return False
+
+        lowered = self._normalize_text(
+            " ".join(text_parts)
+        ).lower()
+
+        required_phrases = (
+            "statement period",
+            "annual",
+            "summary",
+            "year",
+            "interest",
+            "fees",
+        )
+
+        return all(
+            phrase in lowered
+            for phrase in required_phrases
+        )
+
+    def non_transaction_document_reason(
+        self,
+        pdf_path: str | Path,
+    ) -> str | None:
+        """Return a reason when a recognized PDF has no transactions."""
+        if self._is_rbc_loc_annual_summary(
+            pdf_path
+        ):
+            return (
+                "Annual RBC LOC summary; "
+                "no transaction table."
+            )
+
+        if self._is_simplii_annual_summary(
+            pdf_path
+        ):
+            return (
+                "Annual Simplii account summary; "
+                "no transaction table."
+            )
+
+        return None
+
     def _is_rbc_loc_annual_summary(
         self,
         pdf_path: str | Path,
@@ -4573,7 +4791,13 @@ class VisaPDFProcessor:
         file_results: list[BatchFileResult] = []
 
         for pdf_file in pdf_files:
-            if self._is_rbc_loc_annual_summary(pdf_file):
+            skip_reason = (
+                self.non_transaction_document_reason(
+                    pdf_file
+                )
+            )
+
+            if skip_reason is not None:
                 file_results.append(
                     BatchFileResult(
                         pdf_file=pdf_file,
@@ -4581,7 +4805,7 @@ class VisaPDFProcessor:
                         transaction_count=0,
                         source_pages=(),
                         output_csv=None,
-                        error="Annual RBC LOC summary; no transaction table.",
+                        error=skip_reason,
                     )
                 )
                 continue

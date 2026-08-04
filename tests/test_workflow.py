@@ -107,11 +107,11 @@ def make_processor_factory(
         ) -> None:
             self.profile = profile
 
-        def _is_rbc_loc_annual_summary(
+        def non_transaction_document_reason(
             self,
             pdf_file: Path,
-        ) -> bool:
-            return False
+        ) -> str | None:
+            return None
 
         def extract_transactions(
             self,

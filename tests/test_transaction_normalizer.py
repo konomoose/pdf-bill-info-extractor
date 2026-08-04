@@ -292,6 +292,98 @@ class TransactionNormalizerTest(unittest.TestCase):
             "2024-11-12",
         )
 
+    def test_delayed_card_posting_is_resolved(
+        self,
+    ) -> None:
+        result = normalize_transactions(
+            pd.DataFrame(
+                [
+                    {
+                        "Transaction date": "Jan 19",
+                        "Posting date": "Jul 20",
+                        "Description": "Adjustment",
+                        "Amount": "10.00",
+                    }
+                ]
+            ),
+            make_metadata(
+                "capital_one_mastercard_v1",
+                "credit_card_statement",
+                start=date(2022, 6, 24),
+                end=date(2022, 7, 23),
+            ),
+        )
+
+        self.assertEqual(
+            result.loc[0, "transaction_date"],
+            "2022-01-19",
+        )
+        self.assertEqual(
+            result.loc[0, "posting_date"],
+            "2022-07-20",
+        )
+
+    def test_simplii_month_end_entry_may_follow_period(
+        self,
+    ) -> None:
+        result = normalize_transactions(
+            pd.DataFrame(
+                [
+                    {
+                        "Trans. date": "Sep 30",
+                        "Eff. date": "Sep 30",
+                        "Transaction": "Interest",
+                        "Funds out": "",
+                        "Funds in": "0.01",
+                        "Balance": "100.01",
+                    }
+                ]
+            ),
+            make_metadata(
+                "simplii_chequing_account_v1",
+                "bank_account_statement",
+                start=date(2022, 8, 24),
+                end=date(2022, 9, 29),
+            ),
+        )
+
+        self.assertEqual(
+            result.loc[0, "transaction_date"],
+            "2022-09-30",
+        )
+        self.assertEqual(
+            result.loc[0, "effective_date"],
+            "2022-09-30",
+        )
+
+    def test_simplii_post_period_grace_is_limited(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            NormalizationError,
+            "does not fall within",
+        ):
+            normalize_transactions(
+                pd.DataFrame(
+                    [
+                        {
+                            "Trans. date": "Oct 3",
+                            "Eff. date": "Oct 3",
+                            "Transaction": "Interest",
+                            "Funds out": "",
+                            "Funds in": "0.01",
+                            "Balance": "100.01",
+                        }
+                    ]
+                ),
+                make_metadata(
+                    "simplii_chequing_account_v1",
+                    "bank_account_statement",
+                    start=date(2022, 8, 24),
+                    end=date(2022, 9, 29),
+                ),
+            )
+
     def test_blank_directional_fields_remain_blank(self) -> None:
         result = normalize_transactions(
             pd.DataFrame(

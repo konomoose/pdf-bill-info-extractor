@@ -126,6 +126,11 @@ _MONEY_FIELDS = {
     "balance",
 }
 
+_SIMPLII_POST_PERIOD_PROFILES = {
+    "simplii_chequing_account_v1",
+    "simplii_loc_v1",
+}
+
 
 def _is_blank(value: Any) -> bool:
     if value is None:
@@ -237,10 +242,10 @@ def _resolve_row_dates(
             metadata,
         )
     except NormalizationError as primary_error:
-        # Credit-card purchases can occur shortly before a
-        # statement period and post after that period begins.
-        # Recover only when a posting/effective date can itself
-        # be resolved inside the verified statement period.
+        secondary_values: list[
+            tuple[str, Any]
+        ] = []
+
         for target_column in (
             "posting_date",
             "effective_date",
@@ -259,6 +264,20 @@ def _resolve_row_dates(
             if _is_blank(related_value):
                 continue
 
+            secondary_values.append(
+                (
+                    target_column,
+                    related_value,
+                )
+            )
+
+        # Card adjustments and delayed postings may retain
+        # an original transaction date several months before
+        # the statement while posting during the statement.
+        for (
+            target_column,
+            related_value,
+        ) in secondary_values:
             try:
                 related_anchor = (
                     resolve_transaction_date(
@@ -266,10 +285,21 @@ def _resolve_row_dates(
                         metadata,
                     )
                 )
+
+                max_distance_days = (
+                    370
+                    if metadata.document_type
+                    == "credit_card_statement"
+                    else 45
+                )
+
                 recovered_transaction = (
                     resolve_related_date(
                         str(transaction_value),
                         related_anchor,
+                        max_distance_days=(
+                            max_distance_days
+                        ),
                     )
                 )
             except TransactionDateError:
@@ -286,6 +316,90 @@ def _resolve_row_dates(
                     )
                 },
             )
+
+        # Certain Simplii month-end statements include an
+        # interest or month-end entry dated up to three days
+        # after the printed period end. Accept this only when
+        # both transaction and effective dates independently
+        # resolve within that narrow grace period.
+        if (
+            metadata.profile_id
+            in _SIMPLII_POST_PERIOD_PROFILES
+            and metadata.statement_end_date
+            is not None
+            and secondary_values
+        ):
+            try:
+                recovered_transaction = (
+                    resolve_related_date(
+                        str(transaction_value),
+                        metadata.statement_end_date,
+                        max_distance_days=3,
+                    )
+                )
+            except TransactionDateError:
+                recovered_transaction = None
+
+            if (
+                recovered_transaction is not None
+                and 1
+                <= (
+                    recovered_transaction
+                    - metadata.statement_end_date
+                ).days
+                <= 3
+            ):
+                resolved_secondary_dates: dict[
+                    str,
+                    str,
+                ] = {}
+                valid_secondary_dates = True
+
+                for (
+                    target_column,
+                    related_value,
+                ) in secondary_values:
+                    try:
+                        recovered_secondary = (
+                            resolve_related_date(
+                                str(related_value),
+                                recovered_transaction,
+                                max_distance_days=3,
+                            )
+                        )
+                    except TransactionDateError:
+                        valid_secondary_dates = False
+                        break
+
+                    days_after_period = (
+                        recovered_secondary
+                        - metadata.statement_end_date
+                    ).days
+
+                    if not (
+                        1
+                        <= days_after_period
+                        <= 3
+                    ):
+                        valid_secondary_dates = False
+                        break
+
+                    resolved_secondary_dates[
+                        target_column
+                    ] = (
+                        recovered_secondary
+                        .isoformat()
+                    )
+
+                if (
+                    valid_secondary_dates
+                    and resolved_secondary_dates
+                ):
+                    return (
+                        recovered_transaction
+                        .isoformat(),
+                        resolved_secondary_dates,
+                    )
 
         raise NormalizationError(
             f"Row {row_number}: {primary_error}"

@@ -247,6 +247,52 @@ class ExtractionMetadataTest(unittest.TestCase):
             date(2025, 1, 9),
         )
 
+    def test_rbc_visa_period_with_end_year_only(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_rbc_visa_statement_period(
+                "Statement from June 24 to "
+                "July 23, 2024"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2024, 6, 24),
+        )
+        self.assertEqual(
+            end,
+            date(2024, 7, 23),
+        )
+
+    def test_rbc_visa_cross_year_period_with_end_year_only(
+        self,
+    ) -> None:
+        processor = VisaPDFProcessor(
+            profile_path=PROFILE_PATH,
+        )
+
+        start, end = (
+            processor._extract_rbc_visa_statement_period(
+                "Statement from December 10 to "
+                "January 9, 2025"
+            )
+        )
+
+        self.assertEqual(
+            start,
+            date(2024, 12, 10),
+        )
+        self.assertEqual(
+            end,
+            date(2025, 1, 9),
+        )
+
     def test_missing_rbc_visa_period_returns_none(
         self,
     ) -> None:
