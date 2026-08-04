@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -113,6 +112,63 @@ def _find_pdf_files(
         ),
         key=lambda path: str(path).casefold(),
     )
+
+
+def _normalize_selected_pdf_files(
+    selected_pdf_files: Iterable[
+        str | Path
+    ],
+) -> list[Path]:
+    selected: dict[str, Path] = {}
+
+    for value in selected_pdf_files:
+        path = Path(value).resolve()
+
+        if not path.is_file():
+            raise WorkflowError(
+                f"Selected PDF file not found: {path}"
+            )
+
+        if path.suffix.lower() != ".pdf":
+            raise WorkflowError(
+                f"Selected file is not a PDF: {path}"
+            )
+
+        selected[str(path).casefold()] = path
+
+    return sorted(
+        selected.values(),
+        key=lambda path: str(path).casefold(),
+    )
+
+
+def _load_normalized_statement_frames(
+    output_root: Path,
+) -> list[pd.DataFrame]:
+    """
+    Load all normalized statement CSVs below an output root.
+
+    This keeps yearly consolidation complete when the workflow
+    processes only one newly selected statement.
+    """
+    frames: list[pd.DataFrame] = []
+
+    for csv_path in sorted(
+        output_root.rglob(
+            "*_normalized_transactions.csv"
+        ),
+        key=lambda path: str(path).casefold(),
+    ):
+        frame = pd.read_csv(
+            csv_path,
+            dtype=str,
+            keep_default_na=False,
+        )
+
+        if not frame.empty:
+            frames.append(frame)
+
+    return frames
 
 
 def _statement_destination(
@@ -324,11 +380,82 @@ def _write_workflow_summary(
     return summary_path
 
 
+def run_selected_extraction_workflow(
+    profile: ExtractionProfile,
+    source_path: str | Path,
+    output_root: str | Path,
+    *,
+    summary_root: str | Path | None = None,
+    processor_factory: ProcessorFactory = VisaPDFProcessor,
+) -> WorkflowResult:
+    """
+    Run one profile against a user-selected PDF or folder.
+
+    Profile parser settings remain unchanged. Only the runtime
+    input and output paths are replaced.
+    """
+    selected_source = Path(
+        source_path
+    ).resolve()
+    selected_output = Path(
+        output_root
+    ).resolve()
+
+    if selected_source.is_file():
+        if selected_source.suffix.lower() != ".pdf":
+            raise WorkflowError(
+                "The selected input file must be a PDF."
+            )
+
+        runtime_profile = replace(
+            profile,
+            input_folder=selected_source.parent,
+            output_folder=selected_output,
+            recursive=False,
+            preserve_subfolders=False,
+        )
+
+        selected_pdf_files: tuple[Path, ...] | None = (
+            selected_source,
+        )
+
+    elif selected_source.is_dir():
+        runtime_profile = replace(
+            profile,
+            input_folder=selected_source,
+            output_folder=selected_output,
+        )
+
+        selected_pdf_files = None
+
+    else:
+        raise WorkflowError(
+            f"Selected input does not exist: "
+            f"{selected_source}"
+        )
+
+    summary_folder = (
+        Path(summary_root).resolve()
+        if summary_root is not None
+        else selected_output
+    )
+
+    return run_extraction_workflow(
+        [runtime_profile],
+        summary_root=summary_folder,
+        processor_factory=processor_factory,
+        selected_pdf_files=selected_pdf_files,
+    )
+
+
 def run_extraction_workflow(
     profiles: Iterable[ExtractionProfile] | None = None,
     *,
     summary_root: str | Path | None = None,
     processor_factory: ProcessorFactory = VisaPDFProcessor,
+    selected_pdf_files: Iterable[
+        str | Path
+    ] | None = None,
 ) -> WorkflowResult:
     """
     Extract, normalize, and consolidate transactions.
@@ -350,6 +477,24 @@ def run_extraction_workflow(
             "No extraction profiles were selected."
         )
 
+    explicit_pdf_files: tuple[
+        Path,
+        ...,
+    ] | None = None
+
+    if selected_pdf_files is not None:
+        if len(selected_profiles) != 1:
+            raise WorkflowError(
+                "Explicit PDF selection requires exactly "
+                "one extraction profile."
+            )
+
+        explicit_pdf_files = tuple(
+            _normalize_selected_pdf_files(
+                selected_pdf_files
+            )
+        )
+
     summary_folder = (
         Path(summary_root)
         if summary_root is not None
@@ -358,10 +503,7 @@ def run_extraction_workflow(
 
     file_results: list[WorkflowFileResult] = []
 
-    grouped_frames: dict[
-        Path,
-        list[pd.DataFrame],
-    ] = defaultdict(list)
+    successful_output_roots: set[Path] = set()
 
     grouped_slugs: dict[Path, str] = {}
 
@@ -416,10 +558,29 @@ def run_extraction_workflow(
             )
             continue
 
-        pdf_files = _find_pdf_files(
-            profile,
-            source_folder,
-        )
+        if explicit_pdf_files is not None:
+            outside_source = [
+                pdf_file
+                for pdf_file in explicit_pdf_files
+                if not pdf_file.is_relative_to(
+                    source_folder
+                )
+            ]
+
+            if outside_source:
+                raise WorkflowError(
+                    "Every explicitly selected PDF must be "
+                    "inside the selected input folder."
+                )
+
+            pdf_files = list(
+                explicit_pdf_files
+            )
+        else:
+            pdf_files = _find_pdf_files(
+                profile,
+                source_folder,
+            )
 
         if not pdf_files:
             file_results.append(
@@ -518,10 +679,9 @@ def run_extraction_workflow(
                     normalized_csv,
                 )
 
-                if not normalized.empty:
-                    grouped_frames[
-                        output_key
-                    ].append(normalized)
+                successful_output_roots.add(
+                    output_key
+                )
 
                 file_results.append(
                     WorkflowFileResult(
@@ -589,11 +749,18 @@ def run_extraction_workflow(
     yearly_outputs: list[YearlyOutput] = []
 
     for output_root in sorted(
-        grouped_frames,
+        successful_output_roots,
         key=lambda path: str(path).casefold(),
     ):
-        frames = grouped_frames[output_root]
+        frames = (
+            _load_normalized_statement_frames(
+                output_root
+            )
+        )
         slug = grouped_slugs[output_root]
+
+        if not frames:
+            continue
 
         try:
             yearly_frames = (

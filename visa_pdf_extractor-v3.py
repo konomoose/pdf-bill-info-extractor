@@ -7,17 +7,18 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-import pandas as pd
-
 from src.bill_extractor.pdf_processor import (
-    BatchResult,
     PDFProcessingError,
-    VisaPDFProcessor,
 )
 from src.bill_extractor.profile_loader import (
     ExtractionProfile,
     ProfileError,
     discover_profiles,
+)
+from src.bill_extractor.workflow import (
+    WorkflowError,
+    WorkflowResult,
+    run_selected_extraction_workflow,
 )
 
 logging.basicConfig(
@@ -25,6 +26,101 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def workflow_result_messages(
+    result: WorkflowResult,
+) -> list[str]:
+    """Build privacy-safe GUI messages for one workflow run."""
+    messages = [
+        "",
+        "WORKFLOW RESULTS",
+    ]
+
+    for item in result.files:
+        pdf_name = (
+            item.pdf_file.name
+            if item.pdf_file is not None
+            else "(no PDF)"
+        )
+
+        if item.status == "Success":
+            pages = (
+                ", ".join(
+                    map(str, item.source_pages)
+                )
+                if item.source_pages
+                else "none"
+            )
+
+            messages.append(
+                f"SUCCESS: {pdf_name} | "
+                f"{item.transaction_count} transactions | "
+                f"pages {pages}"
+            )
+
+            if item.raw_csv is not None:
+                messages.append(
+                    f"         Raw CSV: {item.raw_csv}"
+                )
+
+            if item.normalized_csv is not None:
+                messages.append(
+                    "         Normalized CSV: "
+                    f"{item.normalized_csv}"
+                )
+
+        elif item.status == "Skipped":
+            messages.append(
+                f"SKIPPED: {pdf_name} | "
+                f"{item.error or 'No details available.'}"
+            )
+
+        else:
+            messages.append(
+                f"FAILED:  {pdf_name} | "
+                f"{item.error or 'No details available.'}"
+            )
+
+    messages.extend(
+        [
+            "",
+            "YEARLY OUTPUTS",
+        ]
+    )
+
+    if result.yearly_outputs:
+        for yearly in result.yearly_outputs:
+            messages.append(
+                f"{yearly.year}: "
+                f"{yearly.transaction_count} transactions | "
+                f"{yearly.csv_path}"
+            )
+    else:
+        messages.append(
+            "No yearly CSVs were created."
+        )
+
+    messages.extend(
+        [
+            "",
+            "SUMMARY",
+            f"Files examined: {len(result.files)}",
+            (
+                "Successful: "
+                f"{result.successful_count}"
+            ),
+            f"Skipped: {result.skipped_count}",
+            f"Failed: {result.failed_count}",
+            (
+                "Transactions extracted: "
+                f"{result.transaction_count}"
+            ),
+            f"Workflow summary CSV: {result.summary_csv}",
+        ]
+    )
+
+    return messages
 
 
 class PDFBillExtractorApp:
@@ -48,7 +144,6 @@ class PDFBillExtractorApp:
             profile.display_name: profile for profile in profiles
         }
         self.active_profile = profiles[0]
-        self.processor = VisaPDFProcessor(profile=self.active_profile)
 
         self.setup_ui()
         self._apply_profile(self.active_profile)
@@ -191,7 +286,6 @@ class PDFBillExtractorApp:
 
     def _apply_profile(self, profile: ExtractionProfile) -> None:
         self.active_profile = profile
-        self.processor = VisaPDFProcessor(profile=profile)
 
         input_folder = profile.resolve_input_folder()
         output_folder = profile.resolve_output_folder()
@@ -214,8 +308,9 @@ class PDFBillExtractorApp:
             else "directly inside the selected folder"
         )
         self.folder_mode_info_var.set(
-            f"Folder mode scans {profile.file_pattern} files {recursive_text}. "
-            "Each statement receives its own CSV."
+            f"Folder mode scans {profile.file_pattern} files "
+            f"{recursive_text}. Raw and normalized statement CSVs, "
+            "yearly consolidated CSVs, and a workflow summary are created."
         )
         self.status_var.set(f"Ready: {profile.display_name}")
 
@@ -271,7 +366,6 @@ class PDFBillExtractorApp:
                 return
             opening_message = f"Processing PDF folder: {input_path}\n"
 
-        processor = self.processor
         profile = self.active_profile
 
         self.process_btn.config(state=tk.DISABLED)
@@ -283,125 +377,98 @@ class PDFBillExtractorApp:
 
         worker = threading.Thread(
             target=self._processing_worker,
-            args=(processor, profile, input_mode, input_path, output_folder),
+            args=(
+                profile,
+                input_path,
+                output_folder,
+            ),
             daemon=True,
         )
         worker.start()
 
-    @staticmethod
-    def _numeric_total(series: pd.Series) -> float:
-        values = (
-            series.fillna("")
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .str.replace("$", "", regex=False)
-        )
-        return pd.to_numeric(values, errors="coerce").fillna(0).sum()
-
-    def _transaction_total_messages(self, transactions: pd.DataFrame) -> list[str]:
-        if "Amount($)" in transactions.columns:
-            total = self._numeric_total(transactions["Amount($)"])
-            return [f"Transaction total: ${total:,.2f}"]
-
-        messages: list[str] = []
-        if "Funds out" in transactions.columns:
-            total_out = self._numeric_total(transactions["Funds out"])
-            messages.append(f"Funds out total: ${total_out:,.2f}")
-        if "Funds in" in transactions.columns:
-            total_in = self._numeric_total(transactions["Funds in"])
-            messages.append(f"Funds in total: ${total_in:,.2f}")
-        return messages
-
     def _processing_worker(
         self,
-        processor: VisaPDFProcessor,
         profile: ExtractionProfile,
-        input_mode: str,
         input_path: str,
         output_folder: str,
     ) -> None:
         try:
-            if input_mode == "file":
-                result, csv_path = processor.process_pdf(input_path, output_folder)
-                messages = [
-                    "\nSUCCESS",
-                    f"Profile: {profile.display_name}",
-                    f"PDF: {Path(input_path).name}",
-                    f"Pages: {', '.join(map(str, result.source_pages))}",
-                    f"Transactions: {len(result.transactions)}",
-                    *self._transaction_total_messages(result.transactions),
-                    f"Saved to: {csv_path}",
-                ]
-                self.root.after(
-                    0,
-                    self._single_processing_succeeded,
-                    messages,
-                    len(result.transactions),
-                )
-            else:
-                batch_result = processor.process_folder(input_path, output_folder)
-                self.root.after(0, self._batch_processing_succeeded, batch_result)
-
-        except PDFProcessingError as exc:
-            logger.exception("PDF processing failed")
-            self.root.after(0, self._processing_failed, str(exc))
-        except Exception as exc:
-            logger.exception("Unexpected processing error")
-            self.root.after(
-                0, self._processing_failed, f"Unexpected error: {exc}"
+            result = run_selected_extraction_workflow(
+                profile,
+                input_path,
+                output_folder,
+                summary_root=output_folder,
             )
 
-    def _single_processing_succeeded(
-        self, messages: list[str], transaction_count: int
+            self.root.after(
+                0,
+                self._workflow_processing_succeeded,
+                result,
+            )
+
+        except (
+            WorkflowError,
+            PDFProcessingError,
+        ) as exc:
+            logger.exception(
+                "Extraction workflow failed"
+            )
+            self.root.after(
+                0,
+                self._processing_failed,
+                str(exc),
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Unexpected workflow error"
+            )
+            self.root.after(
+                0,
+                self._processing_failed,
+                f"Unexpected error: {exc}",
+            )
+
+    def _workflow_processing_succeeded(
+        self,
+        result: WorkflowResult,
     ) -> None:
-        for message in messages:
-            self._append_result(f"{message}\n")
+        for message in workflow_result_messages(
+            result
+        ):
+            self._append_result(
+                f"{message}\n"
+            )
 
-        self.status_var.set(f"Done: {transaction_count} transactions extracted")
         self.progress.stop()
-        self.process_btn.config(state=tk.NORMAL)
-        messagebox.showinfo(
-            "Success", f"Extracted {transaction_count} transactions."
+        self.process_btn.config(
+            state=tk.NORMAL
         )
-
-    def _batch_processing_succeeded(self, result: BatchResult) -> None:
-        self._append_result("\nBATCH RESULTS\n")
-        self._append_result(f"Profile: {result.profile_name} ({result.profile_id})\n")
-
-        for item in result.files:
-            if item.status == "Success":
-                pages = ", ".join(map(str, item.source_pages))
-                self._append_result(
-                    f"SUCCESS: {item.pdf_file.name} | "
-                    f"{item.transaction_count} transactions | pages {pages}\n"
-                )
-                self._append_result(f"         {item.output_csv}\n")
-            else:
-                self._append_result(
-                    f"FAILED:  {item.pdf_file.name} | {item.error}\n"
-                )
-
-        self._append_result("\nSUMMARY\n")
-        self._append_result(f"PDF files found: {len(result.files)}\n")
-        self._append_result(f"Successful: {result.successful_count}\n")
-        self._append_result(f"Failed: {result.failed_count}\n")
-        self._append_result(
-            f"Total transactions extracted: {result.transaction_count}\n"
-        )
-        self._append_result(f"Batch summary CSV: {result.summary_csv}\n")
 
         self.status_var.set(
             f"Done: {result.successful_count} succeeded, "
+            f"{result.skipped_count} skipped, "
             f"{result.failed_count} failed"
         )
-        self.progress.stop()
-        self.process_btn.config(state=tk.NORMAL)
-        messagebox.showinfo(
-            "Batch Complete",
+
+        completion_message = (
             f"Successful: {result.successful_count}\n"
+            f"Skipped: {result.skipped_count}\n"
             f"Failed: {result.failed_count}\n"
-            f"Transactions: {result.transaction_count}",
+            f"Transactions: {result.transaction_count}\n"
+            f"Yearly CSVs: {len(result.yearly_outputs)}"
         )
+
+        if result.failed_count:
+            messagebox.showwarning(
+                "Workflow Complete with Errors",
+                completion_message,
+            )
+        else:
+            messagebox.showinfo(
+                "Workflow Complete",
+                completion_message,
+            )
 
     def _processing_failed(self, error_message: str) -> None:
         self._append_result(f"\nError: {error_message}\n")
@@ -419,7 +486,11 @@ def main() -> None:
     root = tk.Tk()
     try:
         PDFBillExtractorApp(root)
-    except (PDFProcessingError, ProfileError) as exc:
+    except (
+        PDFProcessingError,
+        ProfileError,
+        WorkflowError,
+    ) as exc:
         logger.error("Application startup failed: %s", exc)
         messagebox.showerror("Startup Error", str(exc))
         root.destroy()
