@@ -10,6 +10,11 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from src.bill_extractor.pdf_processor import (
     PDFProcessingError,
 )
+from src.bill_extractor.institution_collector import (
+    InstitutionCollectionError,
+    InstitutionCollectionResult,
+    collect_profile_institution_statement_csvs,
+)
 from src.bill_extractor.profile_loader import (
     ExtractionProfile,
     ProfileError,
@@ -123,6 +128,35 @@ def workflow_result_messages(
     return messages
 
 
+def institution_collection_result_messages(
+    result: InstitutionCollectionResult,
+) -> list[str]:
+    """Build privacy-safe GUI messages for institution collection."""
+    return [
+        "",
+        "INSTITUTION COLLECTION RESULTS",
+        f"Institution: {result.institution}",
+        f"Collection folder: {result.all_statements_folder}",
+        (
+            "Source: configured output folders for all profiles "
+            "at this institution."
+        ),
+        (
+            "Normalized statement CSVs collected: "
+            f"{result.collected_count}"
+        ),
+        (
+            "Combined transactions: "
+            f"{result.combined_transaction_count}"
+        ),
+        f"Combined CSV: {result.combined_csv_path}",
+        (
+            "Stale managed files removed: "
+            f"{result.stale_removed_count}"
+        ),
+    ]
+
+
 class PDFBillExtractorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -140,6 +174,7 @@ class PDFBillExtractorApp:
                 "No extraction profiles were found in config/profiles."
             )
 
+        self.profiles = profiles
         self.profiles_by_name = {
             profile.display_name: profile for profile in profiles
         }
@@ -236,12 +271,36 @@ class PDFBillExtractorApp:
             row=6, column=2, padx=5
         )
 
+        button_frame = ttk.Frame(
+            main_frame
+        )
+        button_frame.grid(
+            row=7,
+            column=0,
+            columnspan=3,
+            pady=10,
+        )
+
         self.process_btn = ttk.Button(
-            main_frame,
+            button_frame,
             text="Extract Transactions",
             command=self.start_processing,
         )
-        self.process_btn.grid(row=7, column=0, columnspan=3, pady=10)
+        self.process_btn.grid(
+            row=0,
+            column=0,
+            padx=(0, 10),
+        )
+
+        self.collect_btn = ttk.Button(
+            button_frame,
+            text="Collect Institution CSVs",
+            command=self.start_collection,
+        )
+        self.collect_btn.grid(
+            row=0,
+            column=1,
+        )
 
         self.folder_mode_info_var = tk.StringVar()
         ttk.Label(
@@ -310,7 +369,10 @@ class PDFBillExtractorApp:
         self.folder_mode_info_var.set(
             f"Folder mode scans {profile.file_pattern} files "
             f"{recursive_text}. Raw and normalized statement CSVs, "
-            "yearly consolidated CSVs, and a workflow summary are created."
+            "yearly consolidated CSVs, and a workflow summary are created. "
+            "Collect Institution CSVs uses the configured profile output "
+            "folders for this institution, not the selected extraction "
+            "output folder."
         )
         self.status_var.set(f"Ready: {profile.display_name}")
 
@@ -368,7 +430,7 @@ class PDFBillExtractorApp:
 
         profile = self.active_profile
 
-        self.process_btn.config(state=tk.DISABLED)
+        self._set_buttons_state(tk.DISABLED)
         self.progress.start(10)
         self.status_var.set("Processing...")
         self.results_text.delete("1.0", tk.END)
@@ -385,6 +447,72 @@ class PDFBillExtractorApp:
             daemon=True,
         )
         worker.start()
+
+    def start_collection(self) -> None:
+        profile = self.active_profile
+
+        self._set_buttons_state(tk.DISABLED)
+        self.progress.start(10)
+        self.status_var.set("Collecting institution CSVs...")
+        self.results_text.delete("1.0", tk.END)
+        self._append_result(
+            f"Institution: {profile.institution}\n"
+        )
+        self._append_result(
+            "Collecting normalized statement CSVs for "
+            f"{profile.institution}.\n"
+        )
+        self._append_result(
+            "Source: configured output folders for all profiles at this "
+            "institution, not the selected extraction output folder.\n"
+        )
+
+        worker = threading.Thread(
+            target=self._collection_worker,
+            args=(profile,),
+            daemon=True,
+        )
+        worker.start()
+
+    def _collection_worker(
+        self,
+        profile: ExtractionProfile,
+    ) -> None:
+        try:
+            result = collect_profile_institution_statement_csvs(
+                profile,
+                profiles=self.profiles,
+            )
+
+            self.root.after(
+                0,
+                self._collection_succeeded,
+                result,
+            )
+
+        except (
+            InstitutionCollectionError,
+            ProfileError,
+            OSError,
+        ) as exc:
+            logger.exception(
+                "Institution collection failed"
+            )
+            self.root.after(
+                0,
+                self._processing_failed,
+                str(exc),
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Unexpected institution collection error"
+            )
+            self.root.after(
+                0,
+                self._processing_failed,
+                f"Unexpected error: {exc}",
+            )
 
     def _processing_worker(
         self,
@@ -441,9 +569,7 @@ class PDFBillExtractorApp:
             )
 
         self.progress.stop()
-        self.process_btn.config(
-            state=tk.NORMAL
-        )
+        self._set_buttons_state(tk.NORMAL)
 
         self.status_var.set(
             f"Done: {result.successful_count} succeeded, "
@@ -470,12 +596,54 @@ class PDFBillExtractorApp:
                 completion_message,
             )
 
+    def _collection_succeeded(
+        self,
+        result: InstitutionCollectionResult,
+    ) -> None:
+        for message in institution_collection_result_messages(
+            result
+        ):
+            self._append_result(
+                f"{message}\n"
+            )
+
+        self.progress.stop()
+        self._set_buttons_state(tk.NORMAL)
+
+        self.status_var.set(
+            "Done: collected "
+            f"{result.collected_count} normalized statement CSVs"
+        )
+
+        completion_message = (
+            f"Institution: {result.institution}\n"
+            "Normalized statement CSVs collected: "
+            f"{result.collected_count}\n"
+            "Combined transactions: "
+            f"{result.combined_transaction_count}\n"
+            f"Combined CSV: {result.combined_csv_path}\n"
+            "Stale managed files removed: "
+            f"{result.stale_removed_count}\n"
+            "Source: configured output folders for all profiles "
+            "at this institution\n"
+            f"Collection folder: {result.all_statements_folder}"
+        )
+
+        messagebox.showinfo(
+            "Institution Collection Complete",
+            completion_message,
+        )
+
     def _processing_failed(self, error_message: str) -> None:
         self._append_result(f"\nError: {error_message}\n")
         self.status_var.set("Processing failed")
         self.progress.stop()
-        self.process_btn.config(state=tk.NORMAL)
+        self._set_buttons_state(tk.NORMAL)
         messagebox.showerror("Error", error_message)
+
+    def _set_buttons_state(self, state: str) -> None:
+        self.process_btn.config(state=state)
+        self.collect_btn.config(state=state)
 
     def _append_result(self, text: str) -> None:
         self.results_text.insert(tk.END, text)
@@ -490,6 +658,7 @@ def main() -> None:
         PDFProcessingError,
         ProfileError,
         WorkflowError,
+        InstitutionCollectionError,
     ) as exc:
         logger.error("Application startup failed: %s", exc)
         messagebox.showerror("Startup Error", str(exc))

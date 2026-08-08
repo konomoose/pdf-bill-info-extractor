@@ -3,6 +3,9 @@ from pathlib import Path
 import sys
 import unittest
 
+from src.bill_extractor.institution_collector import (
+    InstitutionCollectionResult,
+)
 from src.bill_extractor.workflow import (
     WorkflowFileResult,
     WorkflowResult,
@@ -194,6 +197,71 @@ class GUIWorkflowTest(unittest.TestCase):
         )
         self.assertIn(
             "No yearly CSVs were created.",
+            text,
+        )
+
+    def test_collection_result_is_reported_privately(
+        self,
+    ) -> None:
+        result = InstitutionCollectionResult(
+            institution="Test Bank",
+            institution_slug="test_bank",
+            collection_root=Path(
+                "csv_output/institution_collections/test_bank"
+            ),
+            all_statements_folder=Path(
+                "csv_output/institution_collections/"
+                "test_bank/all_statements"
+            ),
+            combined_csv_path=Path(
+                "csv_output/institution_collections/"
+                "test_bank/test_bank_all_transactions.csv"
+            ),
+            manifest_path=Path(
+                "csv_output/institution_collections/"
+                "test_bank/.collection_manifest.json"
+            ),
+            profile_ids=("test_profile_v1",),
+            collected_count=3,
+            combined_transaction_count=12,
+            stale_removed_count=1,
+        )
+
+        text = "\n".join(
+            GUI_MODULE
+            .institution_collection_result_messages(result)
+        )
+
+        self.assertIn(
+            "INSTITUTION COLLECTION RESULTS",
+            text,
+        )
+        self.assertIn(
+            "Institution: Test Bank",
+            text,
+        )
+        self.assertIn(
+            "Collection folder:",
+            text,
+        )
+        self.assertIn(
+            "configured output folders",
+            text,
+        )
+        self.assertIn(
+            "Normalized statement CSVs collected: 3",
+            text,
+        )
+        self.assertIn(
+            "Combined transactions: 12",
+            text,
+        )
+        self.assertIn(
+            "Combined CSV:",
+            text,
+        )
+        self.assertIn(
+            "Stale managed files removed: 1",
             text,
         )
 
