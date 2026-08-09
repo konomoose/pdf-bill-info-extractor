@@ -7,6 +7,9 @@ import unittest
 from src.bill_extractor.institution_collector import (
     InstitutionCollectionResult,
 )
+from src.bill_extractor.pdf_redaction import (
+    REPLACE_REDACTED_PDF_ERROR,
+)
 from src.bill_extractor.pdf_preparation import (
     PDFPreparationResult,
 )
@@ -334,6 +337,58 @@ class GUIWorkflowTest(unittest.TestCase):
         )
         self.assertIn(
             "Redacted folder:",
+            text,
+        )
+        self.assertNotIn(
+            "Jane Example",
+            text,
+        )
+        self.assertNotIn(
+            "secret-password",
+            text,
+        )
+
+    def test_preparation_failure_reason_is_safe_and_actionable(
+        self,
+    ) -> None:
+        result = PDFPreparationResult(
+            account_key="tangerine_chequing",
+            profile_id=None,
+            profile_display_name=None,
+            source_folder=Path(
+                "source_input/tangerine_chequing"
+            ),
+            editable_folder=Path(
+                "editable_input/tangerine_chequing"
+            ),
+            redacted_folder=Path(
+                "redacted_input/tangerine_chequing"
+            ),
+            source_pdf_count=1,
+            security_created_count=0,
+            security_skipped_count=1,
+            security_password_required_count=0,
+            security_failed_count=0,
+            redaction_created_count=0,
+            redaction_already_clean_count=0,
+            redaction_skipped_count=0,
+            redaction_failed_count=1,
+            redaction_failure_messages=(
+                REPLACE_REDACTED_PDF_ERROR,
+            ),
+        )
+
+        text = "\n".join(
+            GUI_MODULE
+            .pdf_preparation_result_messages(result)
+        )
+
+        self.assertIn(
+            "Redaction failure details:",
+            text,
+        )
+        self.assertIn(
+            "Close the redacted PDF",
             text,
         )
         self.assertNotIn(

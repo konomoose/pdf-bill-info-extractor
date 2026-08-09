@@ -14,6 +14,12 @@ class PDFRedactionError(RuntimeError):
     """Raised when PDF redaction cannot complete safely."""
 
 
+REPLACE_REDACTED_PDF_ERROR = (
+    "Could not replace the existing redacted PDF. Close the redacted PDF "
+    "if it is open in another application and run Prepare PDFs again."
+)
+
+
 @dataclass(frozen=True)
 class RedactionRules:
     global_terms: tuple[str, ...]
@@ -378,10 +384,15 @@ def redact_pdf(
                 "Source PDF changed during redaction."
             )
 
-        os.replace(
-            temporary,
-            destination,
-        )
+        try:
+            os.replace(
+                temporary,
+                destination,
+            )
+        except OSError as exc:
+            raise PDFRedactionError(
+                REPLACE_REDACTED_PDF_ERROR
+            ) from exc
 
         if redaction_count == 0:
             return PDFRedactionResult(

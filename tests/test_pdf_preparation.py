@@ -8,7 +8,10 @@ from unittest.mock import patch
 
 import fitz
 
-from src.bill_extractor.pdf_redaction import PDFRedactionError
+from src.bill_extractor.pdf_redaction import (
+    PDFRedactionError,
+    REPLACE_REDACTED_PDF_ERROR,
+)
 from src.bill_extractor.pdf_preparation import (
     PDFPreparationError,
     account_key_for_profile,
@@ -441,10 +444,83 @@ class PDFPreparationTest(unittest.TestCase):
             self.assertEqual(file_hash(redacted), prior_redacted_hash)
             self.assertNotIn("Jane Secret", repr(second))
             self.assertNotIn("Token Delta", repr(second))
-            self.assertNotIn(
+            self.assertIn(
                 "Synthetic verification failure",
                 repr(second),
             )
+
+            with fitz.open(redacted) as document:
+                text = document[0].get_text("text")
+                self.assertNotIn("Jane Secret", text)
+                self.assertIn("Token Delta", text)
+
+    def test_redacted_replacement_failure_reports_safe_reason(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            source = (
+                root
+                / "source_input"
+                / "test_account"
+                / "statement.pdf"
+            )
+
+            make_text_pdf(
+                source,
+                (
+                    "Customer: Jane Secret\n"
+                    "Account: Token Delta"
+                ),
+            )
+
+            first = prepare_account_pdfs(
+                "test_account",
+                ["Jane Secret"],
+                project_root=root,
+            )
+
+            editable = (
+                root
+                / "editable_input"
+                / "test_account"
+                / "statement.pdf"
+            )
+            redacted = (
+                root
+                / "redacted_input"
+                / "test_account"
+                / "statement.pdf"
+            )
+            editable_hash = file_hash(editable)
+            prior_redacted_hash = file_hash(redacted)
+
+            self.assertEqual(first.security_created_count, 1)
+            self.assertEqual(first.redaction_created_count, 1)
+
+            with patch(
+                "src.bill_extractor.pdf_redaction.os.replace",
+                side_effect=PermissionError("synthetic locked file"),
+            ):
+                second = prepare_account_pdfs(
+                    "test_account",
+                    ["Token Delta"],
+                    project_root=root,
+                )
+
+            self.assertEqual(second.security_created_count, 0)
+            self.assertEqual(second.security_skipped_count, 1)
+            self.assertEqual(second.redaction_created_count, 0)
+            self.assertEqual(second.redaction_failed_count, 1)
+            self.assertEqual(
+                second.redaction_failure_messages,
+                (REPLACE_REDACTED_PDF_ERROR,),
+            )
+            self.assertEqual(file_hash(editable), editable_hash)
+            self.assertEqual(file_hash(redacted), prior_redacted_hash)
+            self.assertNotIn("Jane Secret", repr(second))
+            self.assertNotIn("Token Delta", repr(second))
+            self.assertNotIn("synthetic locked file", repr(second))
 
             with fitz.open(redacted) as document:
                 text = document[0].get_text("text")

@@ -31,6 +31,10 @@ from src.bill_extractor.preparation_settings import (
     load_preparation_account_keys,
     remember_preparation_account_key,
 )
+from src.bill_extractor.redaction_term_settings import (
+    load_redaction_terms_for_account,
+    save_redaction_terms_for_account,
+)
 from src.bill_extractor.workflow import (
     WorkflowError,
     WorkflowResult,
@@ -208,6 +212,15 @@ def pdf_preparation_result_messages(
             ]
         )
 
+    if result.redaction_failure_messages:
+        messages.extend(
+            [
+                "",
+                "Redaction failure details:",
+                *result.redaction_failure_messages,
+            ]
+        )
+
     return messages
 
 
@@ -348,7 +361,7 @@ class PDFBillExtractorApp:
         )
         self.preparation_account_combo.bind(
             "<KeyRelease>",
-            self._preparation_account_changed,
+            self._preparation_account_text_changed,
         )
         self.preparation_account_combo.bind(
             "<FocusOut>",
@@ -564,6 +577,47 @@ class PDFBillExtractorApp:
     ) -> None:
         self.preparation_account_was_edited = True
         self._update_preparation_paths()
+        self._load_redaction_terms_for_preparation_account()
+
+    def _preparation_account_text_changed(
+        self,
+        _event: object | None = None,
+    ) -> None:
+        self.preparation_account_was_edited = True
+        self._update_preparation_paths()
+
+    def _set_redaction_terms(
+        self,
+        terms: tuple[str, ...],
+    ) -> None:
+        self.redaction_terms_text.delete(
+            "1.0",
+            tk.END,
+        )
+
+        if terms:
+            self.redaction_terms_text.insert(
+                "1.0",
+                "\n".join(terms) + "\n",
+            )
+
+    def _load_redaction_terms_for_preparation_account(
+        self,
+    ) -> None:
+        account_key = self.preparation_account_var.get().strip()
+
+        if not account_key:
+            self._set_redaction_terms(())
+            return
+
+        try:
+            terms = load_redaction_terms_for_account(
+                account_key
+            )
+        except Exception:
+            terms = ()
+
+        self._set_redaction_terms(terms)
 
     def _update_preparation_paths(self) -> None:
         account_key = self.preparation_account_var.get().strip()
@@ -614,6 +668,7 @@ class PDFBillExtractorApp:
                 )
 
         self._update_preparation_paths()
+        self._load_redaction_terms_for_preparation_account()
 
         headers = ", ".join(profile.required_headers)
         self.profile_info_var.set(
@@ -723,11 +778,15 @@ class PDFBillExtractorApp:
             remember_preparation_account_key(
                 folders.account_key.as_posix()
             )
+            save_redaction_terms_for_account(
+                folders.account_key.as_posix(),
+                terms,
+            )
         except Exception as exc:
             messagebox.showerror(
                 "PDF Preparation Error",
                 (
-                    "Could not save the preparation account key: "
+                    "Could not save the local preparation settings: "
                     f"{exc}"
                 ),
             )
@@ -1081,6 +1140,12 @@ class PDFBillExtractorApp:
             f"Redacted folder: {result.redacted_folder}\n"
             "Review the redacted PDFs before sharing them."
         )
+
+        if result.redaction_failure_messages:
+            completion_message += (
+                "\nRedaction failure details:\n"
+                + "\n".join(result.redaction_failure_messages)
+            )
 
         if (
             result.security_password_required_count

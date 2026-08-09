@@ -49,6 +49,7 @@ class PDFPreparationResult:
     redaction_already_clean_count: int
     redaction_skipped_count: int
     redaction_failed_count: int
+    redaction_failure_messages: tuple[str, ...] = ()
 
 
 def _project_root(
@@ -231,6 +232,7 @@ def prepare_account_pdfs(
     redaction_already_clean = 0
     redaction_skipped = 0
     redaction_failed = 0
+    redaction_failure_messages: set[str] = set()
 
     for source_pdf in source_pdfs:
         try:
@@ -264,12 +266,16 @@ def prepare_account_pdfs(
                 force=True,
             )
 
-        except PDFRedactionError:
+        except PDFRedactionError as exc:
             redaction_failed += 1
+            redaction_failure_messages.add(str(exc))
             continue
 
         except Exception:
             redaction_failed += 1
+            redaction_failure_messages.add(
+                "An unexpected redaction error occurred."
+            )
             continue
 
         if redaction_result.status == "created":
@@ -303,6 +309,12 @@ def prepare_account_pdfs(
         redaction_already_clean_count=redaction_already_clean,
         redaction_skipped_count=redaction_skipped,
         redaction_failed_count=redaction_failed,
+        redaction_failure_messages=tuple(
+            sorted(
+                redaction_failure_messages,
+                key=str.casefold,
+            )
+        ),
     )
 
 

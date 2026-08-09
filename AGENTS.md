@@ -72,9 +72,14 @@ Real/private redaction terms and PDF passwords must never appear in:
 - result dataclasses
 - generated summaries
 - workflow CSVs
-- committed configuration
 - test fixtures
 - Git history
+
+Real/private redaction terms may be persisted only in the Git-ignored local
+file `config/redaction_terms.local.json`. They must never be committed,
+logged, copied into tests, or written to any other tracked file.
+
+PDF passwords must never be persisted.
 
 Synthetic sentinel/example values may be used in synthetic tests when needed
 to verify privacy behavior.
