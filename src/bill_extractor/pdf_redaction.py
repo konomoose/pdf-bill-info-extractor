@@ -21,6 +21,15 @@ REPLACE_REDACTED_PDF_ERROR = (
 
 
 @dataclass(frozen=True)
+class StructuredRedactionOptions:
+    etransfer_keep_first_name_only: bool = False
+
+    @property
+    def has_rules(self) -> bool:
+        return self.etransfer_keep_first_name_only
+
+
+@dataclass(frozen=True)
 class RedactionRules:
     global_terms: tuple[str, ...]
     institution_terms: dict[str, tuple[str, ...]]
@@ -38,6 +47,18 @@ class PDFRedactionResult:
     status: str
     message: str
     redaction_count: int = 0
+
+
+@dataclass(frozen=True)
+class PositionedWord:
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    text: str
+    block: int
+    line: int
+    word: int
 
 
 def file_hash(path: Path) -> str:
@@ -179,6 +200,507 @@ def collect_pdfs(source_root: Path) -> list[Path]:
     )
 
 
+def _positioned_words(
+    page: fitz.Page,
+) -> list[PositionedWord]:
+    return [
+        PositionedWord(
+            x0=float(word[0]),
+            y0=float(word[1]),
+            x1=float(word[2]),
+            y1=float(word[3]),
+            text=str(word[4]),
+            block=int(word[5]),
+            line=int(word[6]),
+            word=int(word[7]),
+        )
+        for word in page.get_text("words")
+    ]
+
+
+def _word_token(
+    word: PositionedWord,
+) -> str:
+    return word.text.strip().casefold().rstrip(":")
+
+
+def _table_geometry(
+    words: list[PositionedWord],
+) -> tuple[float, float, float, float] | None:
+    transaction_words = [
+        word
+        for word in words
+        if _word_token(word) == "transaction"
+    ]
+    description_words = [
+        word
+        for word in words
+        if _word_token(word) == "description"
+    ]
+    amount_words = [
+        word
+        for word in words
+        if _word_token(word).startswith("amount")
+    ]
+    balance_words = [
+        word
+        for word in words
+        if _word_token(word).startswith("balance")
+    ]
+
+    for description in description_words:
+        same_line_transaction = [
+            word
+            for word in transaction_words
+            if abs(word.y0 - description.y0) <= 3.0
+        ]
+        description_label_transaction = [
+            word
+            for word in same_line_transaction
+            if word.x0 < description.x0
+        ]
+        same_line_amount = [
+            word
+            for word in amount_words
+            if abs(word.y0 - description.y0) <= 3.0
+        ]
+        same_line_balance = [
+            word
+            for word in balance_words
+            if abs(word.y0 - description.y0) <= 3.0
+        ]
+
+        if (
+            not same_line_transaction
+            or not description_label_transaction
+            or not same_line_amount
+        ):
+            continue
+
+        date_left = min(
+            word.x0
+            for word in same_line_transaction
+        )
+        description_left = max(
+            word.x0
+            for word in description_label_transaction
+        )
+        amount_left = min(
+            word.x0
+            for word in same_line_amount
+        )
+        balance_left = (
+            min(word.x0 for word in same_line_balance)
+            if same_line_balance
+            else amount_left + 80.0
+        )
+
+        return (
+            date_left,
+            description_left,
+            amount_left,
+            balance_left,
+        )
+
+    return None
+
+
+def _is_description_word(
+    word: PositionedWord,
+    *,
+    description_left: float,
+    amount_left: float,
+) -> bool:
+    return (
+        word.x0 >= description_left - 2.0
+        and word.x0 < amount_left - 4.0
+    )
+
+
+def _group_words_by_visual_y(
+    words: list[PositionedWord],
+    *,
+    tolerance: float = 2.0,
+) -> list[tuple[float, list[PositionedWord]]]:
+    groups: list[tuple[float, list[PositionedWord]]] = []
+
+    for word in sorted(
+        words,
+        key=lambda item: (
+            item.y0,
+            item.x0,
+            item.word,
+        ),
+    ):
+        if groups and abs(word.y0 - groups[-1][0]) <= tolerance:
+            groups[-1][1].append(word)
+            continue
+
+        groups.append(
+            (
+                word.y0,
+                [word],
+            )
+        )
+
+    return [
+        (
+            y,
+            sorted(
+                group_words,
+                key=lambda word: (
+                    word.x0,
+                    word.word,
+                ),
+            ),
+        )
+        for y, group_words in groups
+    ]
+
+
+def _line_tokens(
+    words: list[PositionedWord],
+) -> tuple[str, ...]:
+    return tuple(
+        _word_token(word)
+        for word in sorted(
+            words,
+            key=lambda word: (
+                word.x0,
+                word.word,
+            ),
+        )
+    )
+
+
+def _is_description_header_line(
+    words: list[PositionedWord],
+) -> bool:
+    tokens = _line_tokens(words)
+    return (
+        "transaction" in tokens
+        and "description" in tokens
+    )
+
+
+def _is_closing_boundary_line(
+    words: list[PositionedWord],
+) -> bool:
+    tokens = _line_tokens(words)
+    return (
+        "closing" in tokens
+        and "balance" in tokens
+    )
+
+
+def _has_side_column_transaction_signals(
+    words: list[PositionedWord],
+    *,
+    start_y: float,
+    end_y: float,
+    date_left: float,
+    description_left: float,
+    amount_left: float,
+    balance_left: float,
+) -> bool:
+    side_words = [
+        word
+        for word in words
+        if word.y0 >= start_y - 2.0
+        and word.y0 < end_y - 1.0
+    ]
+    date_side_words = [
+        word
+        for word in side_words
+        if word.x0 < description_left - 8.0
+        and word.x0 >= date_left - 8.0
+    ]
+    amount_side_words = [
+        word
+        for word in side_words
+        if word.x0 >= amount_left - 8.0
+        and word.x0 < balance_left + 120.0
+    ]
+
+    return any(
+        abs(date_word.y0 - amount_word.y0) <= 3.0
+        for date_word in date_side_words
+        for amount_word in amount_side_words
+    )
+
+
+def _description_line_groups(
+    words: list[PositionedWord],
+    *,
+    description_left: float,
+    amount_left: float,
+) -> list[tuple[float, list[PositionedWord]]]:
+    description_words = [
+        word
+        for word in words
+        if _is_description_word(
+            word,
+            description_left=description_left,
+            amount_left=amount_left,
+        )
+    ]
+
+    return _group_words_by_visual_y(description_words)
+
+
+def _description_start_ys(
+    words: list[PositionedWord],
+    *,
+    date_left: float,
+    description_left: float,
+    amount_left: float,
+    balance_left: float,
+) -> list[float]:
+    groups = [
+        (y, line_words)
+        for y, line_words in _description_line_groups(
+            words,
+            description_left=description_left,
+            amount_left=amount_left,
+        )
+        if not _is_description_header_line(line_words)
+        and not _is_closing_boundary_line(line_words)
+    ]
+    starts: list[float] = []
+
+    for index, (y, _line_words) in enumerate(groups):
+        next_y = (
+            groups[index + 1][0]
+            if index + 1 < len(groups)
+            else float("inf")
+        )
+
+        if _has_side_column_transaction_signals(
+            words,
+            start_y=y,
+            end_y=next_y,
+            date_left=date_left,
+            description_left=description_left,
+            amount_left=amount_left,
+            balance_left=balance_left,
+        ):
+            starts.append(y)
+
+    return starts
+
+
+def _closing_boundary_ys(
+    words: list[PositionedWord],
+    *,
+    description_left: float,
+    amount_left: float,
+) -> list[float]:
+    return [
+        y
+        for y, line_words in _description_line_groups(
+            words,
+            description_left=description_left,
+            amount_left=amount_left,
+        )
+        if _is_closing_boundary_line(line_words)
+    ]
+
+
+def _description_band_words(
+    words: list[PositionedWord],
+    *,
+    start_y: float,
+    end_y: float,
+    description_left: float,
+    amount_left: float,
+) -> list[PositionedWord]:
+    return [
+        word
+        for word in sorted(
+            words,
+            key=lambda item: (
+                item.y0,
+                item.x0,
+                item.word,
+            ),
+        )
+        if word.y0 >= start_y - 1.0
+        and word.y0 < end_y - 1.0
+        and _is_description_word(
+            word,
+            description_left=description_left,
+            amount_left=amount_left,
+        )
+    ]
+
+
+def _band_for_word(
+    word: PositionedWord,
+    *,
+    start_ys: list[float],
+    closing_ys: list[float],
+    page_bottom: float,
+) -> tuple[float, float] | None:
+    current_start = None
+
+    for start_y in start_ys:
+        if start_y <= word.y0 + 1.0:
+            current_start = start_y
+        else:
+            break
+
+    if current_start is None:
+        return None
+
+    candidates = [
+        boundary
+        for boundary in (*start_ys, *closing_ys, page_bottom)
+        if boundary > current_start + 1.0
+    ]
+
+    return (
+        current_start,
+        min(candidates) if candidates else page_bottom,
+    )
+
+
+def _same_positioned_word(
+    left: PositionedWord,
+    right: PositionedWord,
+) -> bool:
+    return (
+        left.block == right.block
+        and left.line == right.line
+        and left.word == right.word
+        and left.text == right.text
+        and abs(left.x0 - right.x0) <= 0.01
+        and abs(left.y0 - right.y0) <= 0.01
+    )
+
+
+def _positioned_word_index(
+    words: list[PositionedWord],
+    target: PositionedWord,
+) -> int | None:
+    for index, word in enumerate(words):
+        if _same_positioned_word(word, target):
+            return index
+
+    return None
+
+
+def _redaction_rect_for_word(
+    word: PositionedWord,
+) -> fitz.Rect:
+    height = word.y1 - word.y0
+    vertical_inset = height * 0.18
+
+    return fitz.Rect(
+        word.x0,
+        word.y0 + vertical_inset,
+        word.x1,
+        word.y1 - vertical_inset,
+    )
+
+
+def _redact_etransfer_names_on_page(
+    page: fitz.Page,
+) -> int:
+    words = _positioned_words(page)
+    geometry = _table_geometry(words)
+
+    if geometry is None:
+        return 0
+
+    date_left, description_left, amount_left, balance_left = geometry
+    start_ys = _description_start_ys(
+        words,
+        date_left=date_left,
+        description_left=description_left,
+        amount_left=amount_left,
+        balance_left=balance_left,
+    )
+
+    if not start_ys:
+        return 0
+
+    closing_ys = _closing_boundary_ys(
+        words,
+        description_left=description_left,
+        amount_left=amount_left,
+    )
+    description_words = _description_band_words(
+        words,
+        start_y=start_ys[0],
+        end_y=page.rect.y1 + 1.0,
+        description_left=description_left,
+        amount_left=amount_left,
+    )
+    redaction_count = 0
+    index = 0
+
+    while index <= len(description_words) - 4:
+        current = description_words[index:index + 4]
+        tokens = [
+            _word_token(word)
+            for word in current
+        ]
+
+        if (
+            tokens[0] == "interac"
+            and tokens[1] == "e-transfer"
+            and tokens[2] in ("from", "to")
+        ):
+            band = _band_for_word(
+                current[0],
+                start_ys=start_ys,
+                closing_ys=closing_ys,
+                page_bottom=page.rect.y1 + 1.0,
+            )
+
+            if band is None:
+                index += 1
+                continue
+
+            start_y, end_y = band
+            band_words = _description_band_words(
+                words,
+                start_y=start_y,
+                end_y=end_y,
+                description_left=description_left,
+                amount_left=amount_left,
+            )
+
+            prefix_position = _positioned_word_index(
+                band_words,
+                current[2],
+            )
+
+            if prefix_position is None:
+                index += 1
+                continue
+
+            name_words = band_words[prefix_position + 1:]
+
+            for word in name_words[1:]:
+                page.add_redact_annot(
+                    _redaction_rect_for_word(word),
+                    fill=(0, 0, 0),
+                    cross_out=False,
+                )
+                redaction_count += 1
+
+            index += max(
+                len(name_words),
+                1,
+            )
+            continue
+
+        index += 1
+
+    return redaction_count
+
+
 def output_path_for(
     source: Path,
     source_root: Path,
@@ -278,11 +800,17 @@ def redact_pdf(
     terms: tuple[str, ...],
     *,
     force: bool = False,
+    structured_options: StructuredRedactionOptions | None = None,
 ) -> PDFRedactionResult:
     source = source.resolve()
     source_root = source_root.resolve()
     output_root = output_root.resolve()
     terms = normalize_redaction_terms(tuple(terms))
+    structured_options = (
+        structured_options
+        if structured_options is not None
+        else StructuredRedactionOptions()
+    )
 
     destination = output_path_for(
         source,
@@ -290,7 +818,7 @@ def redact_pdf(
         output_root,
     )
 
-    if not terms:
+    if not terms and not structured_options.has_rules:
         return PDFRedactionResult(
             source=source,
             destination=None,
@@ -347,6 +875,17 @@ def redact_pdf(
                         )
                         redaction_count += 1
                         page_redactions += 1
+
+                if page_redactions:
+                    page.apply_redactions()
+                    page_redactions = 0
+
+                if structured_options.etransfer_keep_first_name_only:
+                    structured_redactions = (
+                        _redact_etransfer_names_on_page(page)
+                    )
+                    page_redactions += structured_redactions
+                    redaction_count += structured_redactions
 
                 if page_redactions:
                     page.apply_redactions()
@@ -429,6 +968,7 @@ def redact_pdf_with_rules(
     rules: RedactionRules,
     *,
     force: bool = False,
+    structured_options: StructuredRedactionOptions | None = None,
 ) -> PDFRedactionResult:
     institution = institution_for(
         source.resolve(),
@@ -441,6 +981,7 @@ def redact_pdf_with_rules(
         output_root,
         rules.terms_for(institution),
         force=force,
+        structured_options=structured_options,
     )
 
 

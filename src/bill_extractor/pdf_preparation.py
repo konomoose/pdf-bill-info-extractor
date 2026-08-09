@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .pdf_redaction import (
     PDFRedactionError,
+    StructuredRedactionOptions,
     normalize_redaction_terms,
     redact_pdf,
 )
@@ -195,14 +196,20 @@ def prepare_account_pdfs(
     force: bool = False,
     project_root: Path | None = None,
     profile: ExtractionProfile | None = None,
+    structured_options: StructuredRedactionOptions | None = None,
 ) -> PDFPreparationResult:
+    structured_options = (
+        structured_options
+        if structured_options is not None
+        else StructuredRedactionOptions()
+    )
     normalized_terms = normalize_redaction_terms(
         terms
     )
 
-    if not normalized_terms:
+    if not normalized_terms and not structured_options.has_rules:
         raise PDFPreparationError(
-            "At least one redaction term is required."
+            "At least one redaction rule is required."
         )
 
     folders = preparation_folders_for_account(
@@ -264,6 +271,7 @@ def prepare_account_pdfs(
                 folders.redacted_folder,
                 normalized_terms,
                 force=True,
+                structured_options=structured_options,
             )
 
         except PDFRedactionError as exc:
@@ -325,6 +333,7 @@ def prepare_profile_pdfs(
     password: str | None = None,
     force: bool = False,
     project_root: Path | None = None,
+    structured_options: StructuredRedactionOptions | None = None,
 ) -> PDFPreparationResult:
     return prepare_account_pdfs(
         account_key_for_profile(
@@ -336,4 +345,5 @@ def prepare_profile_pdfs(
         force=force,
         project_root=project_root,
         profile=profile,
+        structured_options=structured_options,
     )

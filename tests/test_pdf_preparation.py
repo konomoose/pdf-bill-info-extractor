@@ -11,6 +11,7 @@ import fitz
 from src.bill_extractor.pdf_redaction import (
     PDFRedactionError,
     REPLACE_REDACTED_PDF_ERROR,
+    StructuredRedactionOptions,
 )
 from src.bill_extractor.pdf_preparation import (
     PDFPreparationError,
@@ -29,6 +30,10 @@ RAW_COLUMNS = (
     "Withdrawals ($)",
     "Deposits ($)",
     "Balance ($)",
+)
+
+ETRANSFER_OPTION = StructuredRedactionOptions(
+    etransfer_keep_first_name_only=True,
 )
 
 
@@ -82,6 +87,33 @@ def make_text_pdf(
                 user_pw=password,
                 permissions=-1,
             )
+
+
+def make_transaction_table_pdf(
+    path: Path,
+    rows: tuple[tuple[str, ...], ...],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with fitz.open() as document:
+        page = document.new_page(width=612, height=792)
+        page.insert_text((50, 50), "Transaction Date")
+        page.insert_text((145, 50), "Transaction Description")
+        page.insert_text((410, 50), "Amount($)")
+        page.insert_text((500, 50), "Balance($)")
+
+        y = 80
+        for row_number, lines in enumerate(rows, start=1):
+            page.insert_text((50, y), f"2025-01-{row_number:02d}")
+
+            for offset, line in enumerate(lines):
+                page.insert_text((145, y + (offset * 16)), line)
+
+            page.insert_text((410, y), "-10.00")
+            page.insert_text((500, y), "100.00")
+            y += 28 + ((len(lines) - 1) * 16)
+
+        document.save(path)
 
 
 def make_image_only_pdf(path: Path) -> None:
@@ -383,6 +415,76 @@ class PDFPreparationTest(unittest.TestCase):
                 self.assertIn("Jane Secret", second_text)
                 self.assertNotIn("Token Delta", second_text)
                 self.assertIn("Coffee Shop", second_text)
+
+    def test_repeated_prepare_replaces_output_with_structured_rule(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            source = (
+                root
+                / "source_input"
+                / "test_account"
+                / "statement.pdf"
+            )
+
+            make_transaction_table_pdf(
+                source,
+                (
+                    (
+                        "INTERAC e-Transfer From: ADRIAN CORY SUTHERLAND",
+                    ),
+                ),
+            )
+
+            first = prepare_account_pdfs(
+                "test_account",
+                ["MISSING EXACT TERM"],
+                project_root=root,
+            )
+
+            editable = (
+                root
+                / "editable_input"
+                / "test_account"
+                / "statement.pdf"
+            )
+            redacted = (
+                root
+                / "redacted_input"
+                / "test_account"
+                / "statement.pdf"
+            )
+            editable_hash = file_hash(editable)
+
+            self.assertEqual(first.security_created_count, 1)
+            self.assertEqual(first.redaction_already_clean_count, 1)
+
+            with fitz.open(redacted) as document:
+                first_text = document[0].get_text("text")
+                self.assertIn("ADRIAN", first_text)
+                self.assertIn("CORY", first_text)
+                self.assertIn("SUTHERLAND", first_text)
+
+            second = prepare_account_pdfs(
+                "test_account",
+                [],
+                project_root=root,
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            self.assertEqual(second.security_created_count, 0)
+            self.assertEqual(second.security_skipped_count, 1)
+            self.assertEqual(second.redaction_created_count, 1)
+            self.assertEqual(file_hash(editable), editable_hash)
+            self.assertNotIn("ADRIAN CORY", repr(second))
+            self.assertNotIn("SUTHERLAND", repr(second))
+
+            with fitz.open(redacted) as document:
+                second_text = document[0].get_text("text")
+                self.assertIn("ADRIAN", second_text)
+                self.assertNotIn("CORY", second_text)
+                self.assertNotIn("SUTHERLAND", second_text)
 
     def test_failed_redacted_rebuild_preserves_previous_output(
         self,

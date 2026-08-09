@@ -27,13 +27,16 @@ from src.bill_extractor.pdf_preparation import (
     preparation_folders_for_account,
     prepare_account_pdfs,
 )
+from src.bill_extractor.pdf_redaction import (
+    StructuredRedactionOptions,
+)
 from src.bill_extractor.preparation_settings import (
     load_preparation_account_keys,
     remember_preparation_account_key,
 )
 from src.bill_extractor.redaction_term_settings import (
-    load_redaction_terms_for_account,
-    save_redaction_terms_for_account,
+    load_redaction_account_settings,
+    save_redaction_account_settings,
 )
 from src.bill_extractor.workflow import (
     WorkflowError,
@@ -334,6 +337,9 @@ class PDFBillExtractorApp:
         self.prep_source_var = tk.StringVar()
         self.prep_editable_var = tk.StringVar()
         self.prep_redacted_var = tk.StringVar()
+        self.etransfer_keep_first_name_only_var = tk.BooleanVar(
+            value=False
+        )
 
         ttk.Label(
             preparation_frame,
@@ -411,10 +417,23 @@ class PDFBillExtractorApp:
             sticky=(tk.W, tk.E),
         )
 
+        self.etransfer_keep_first_name_only_check = ttk.Checkbutton(
+            preparation_frame,
+            text="e-Transfer names - keep first name only",
+            variable=self.etransfer_keep_first_name_only_var,
+        )
+        self.etransfer_keep_first_name_only_check.grid(
+            row=6,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            pady=(6, 2),
+        )
+
         ttk.Label(
             preparation_frame,
             text="PDF Password (optional):",
-        ).grid(row=6, column=0, sticky=tk.W, pady=(6, 2))
+        ).grid(row=7, column=0, sticky=tk.W, pady=(6, 2))
         self.pdf_password_var = tk.StringVar()
         self.pdf_password_entry = ttk.Entry(
             preparation_frame,
@@ -423,7 +442,7 @@ class PDFBillExtractorApp:
             width=32,
         )
         self.pdf_password_entry.grid(
-            row=6,
+            row=7,
             column=1,
             sticky=tk.W,
             padx=5,
@@ -436,7 +455,7 @@ class PDFBillExtractorApp:
             command=self.start_preparation,
         )
         self.prepare_btn.grid(
-            row=7,
+            row=8,
             column=0,
             sticky=tk.W,
             pady=(8, 2),
@@ -445,7 +464,7 @@ class PDFBillExtractorApp:
             preparation_frame,
             text="Review redacted PDFs before sharing them outside this computer.",
             wraplength=760,
-        ).grid(row=7, column=1, sticky=tk.W, padx=5, pady=(8, 2))
+        ).grid(row=8, column=1, sticky=tk.W, padx=5, pady=(8, 2))
 
         ttk.Label(main_frame, text="Input Mode:").grid(
             row=4, column=0, sticky=tk.W, pady=5
@@ -608,16 +627,22 @@ class PDFBillExtractorApp:
 
         if not account_key:
             self._set_redaction_terms(())
+            self.etransfer_keep_first_name_only_var.set(False)
             return
 
         try:
-            terms = load_redaction_terms_for_account(
+            settings = load_redaction_account_settings(
                 account_key
             )
         except Exception:
-            terms = ()
+            self._set_redaction_terms(())
+            self.etransfer_keep_first_name_only_var.set(False)
+            return
 
-        self._set_redaction_terms(terms)
+        self._set_redaction_terms(settings.terms)
+        self.etransfer_keep_first_name_only_var.set(
+            settings.etransfer_keep_first_name_only
+        )
 
     def _update_preparation_paths(self) -> None:
         account_key = self.preparation_account_var.get().strip()
@@ -744,11 +769,16 @@ class PDFBillExtractorApp:
 
     def start_preparation(self) -> None:
         terms = self._redaction_terms()
+        structured_options = StructuredRedactionOptions(
+            etransfer_keep_first_name_only=(
+                self.etransfer_keep_first_name_only_var.get()
+            )
+        )
 
-        if not terms:
+        if not terms and not structured_options.has_rules:
             messagebox.showerror(
                 "Error",
-                "Enter at least one exact redaction term.",
+                "Enter at least one exact redaction term or enable a structured redaction rule.",
             )
             return
 
@@ -778,9 +808,12 @@ class PDFBillExtractorApp:
             remember_preparation_account_key(
                 folders.account_key.as_posix()
             )
-            save_redaction_terms_for_account(
+            save_redaction_account_settings(
                 folders.account_key.as_posix(),
                 terms,
+                etransfer_keep_first_name_only=(
+                    structured_options.etransfer_keep_first_name_only
+                ),
             )
         except Exception as exc:
             messagebox.showerror(
@@ -824,6 +857,7 @@ class PDFBillExtractorApp:
                 folders.account_key.as_posix(),
                 terms,
                 password_arg,
+                structured_options,
             ),
             daemon=True,
         )
@@ -945,12 +979,14 @@ class PDFBillExtractorApp:
         account_key: str,
         terms: tuple[str, ...],
         password: str | None,
+        structured_options: StructuredRedactionOptions,
     ) -> None:
         try:
             result = prepare_account_pdfs(
                 account_key,
                 terms,
                 password=password,
+                structured_options=structured_options,
             )
 
             self.root.after(

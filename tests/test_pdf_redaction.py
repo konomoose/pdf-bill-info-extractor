@@ -10,6 +10,7 @@ import fitz
 
 from src.bill_extractor.pdf_redaction import (
     PDFRedactionError,
+    StructuredRedactionOptions,
     normalize_redaction_terms,
     redact_pdf,
     verify_redacted_output,
@@ -39,6 +40,79 @@ def make_private_pdf(path: Path) -> None:
             b"Synthetic embedded content",
         )
         document.save(path)
+
+
+def make_transaction_table_pdf(
+    path: Path,
+    rows: tuple[tuple[str, ...], ...],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with fitz.open() as document:
+        page = document.new_page(width=612, height=792)
+        page.insert_text((50, 50), "Transaction Date")
+        page.insert_text((145, 50), "Transaction Description")
+        page.insert_text((410, 50), "Amount($)")
+        page.insert_text((500, 50), "Balance($)")
+
+        y = 80
+        for row_number, lines in enumerate(rows, start=1):
+            page.insert_text((50, y), f"2025-01-{row_number:02d}")
+            for offset, line in enumerate(lines):
+                page.insert_text((145, y + (offset * 16)), line)
+
+            page.insert_text((410, y), "-10.00")
+            page.insert_text((500, y), "100.00")
+            y += 28 + ((len(lines) - 1) * 16)
+
+        document.save(path)
+
+
+def make_offset_transaction_table_pdf(
+    path: Path,
+    rows: tuple[tuple[float, tuple[str, ...]], ...],
+    *,
+    closing_balance_y: float | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with fitz.open() as document:
+        page = document.new_page(width=612, height=792)
+        page.insert_text((50, 50), "Transaction Date")
+        page.insert_text((145, 50), "Transaction Description")
+        page.insert_text((410, 50), "Amount($)")
+        page.insert_text((500, 50), "Balance($)")
+
+        for row_number, (y, lines) in enumerate(rows, start=1):
+            side_y = y + 6
+            page.insert_text((50, side_y), f"2025-02-{row_number:02d}")
+
+            for offset, line in enumerate(lines):
+                page.insert_text((145, y + (offset * 12)), line)
+
+            page.insert_text((410, side_y), "-11.00")
+            page.insert_text((500, side_y), "200.00")
+
+        if closing_balance_y is not None:
+            page.insert_text((145, closing_balance_y), "Closing Balance")
+            page.insert_text((500, closing_balance_y + 6), "300.00")
+
+        document.save(path)
+
+
+def redacted_text(
+    path: Path,
+) -> str:
+    with fitz.open(path) as document:
+        return "\n".join(
+            page.get_text("text")
+            for page in document
+        )
+
+
+ETRANSFER_OPTION = StructuredRedactionOptions(
+    etransfer_keep_first_name_only=True,
+)
 
 
 class PDFRedactionModuleTest(unittest.TestCase):
@@ -220,6 +294,530 @@ class PDFRedactionModuleTest(unittest.TestCase):
                     )
 
             self.assertFalse(temporary.exists())
+
+    def test_etransfer_from_keeps_first_name_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_transaction_table_pdf(
+                source,
+                (
+                    (
+                        "INTERAC e-Transfer From: ALPHA BRAVO CHARLIE",
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("INTERAC e-Transfer From:", text)
+            self.assertIn("ALPHA", text)
+            self.assertNotIn("BRAVO", text)
+            self.assertNotIn("CHARLIE", text)
+            self.assertNotIn("ALPHA BRAVO", repr(result))
+
+    def test_etransfer_to_keeps_first_name_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_transaction_table_pdf(
+                source,
+                (
+                    (
+                        "INTERAC e-Transfer To: DELTA ECHO",
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("INTERAC e-Transfer To:", text)
+            self.assertIn("DELTA", text)
+            self.assertNotIn("ECHO", text)
+
+    def test_etransfer_two_word_name_redacts_second_word(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_transaction_table_pdf(
+                source,
+                (
+                    (
+                        "INTERAC e-Transfer From: GOLF HOTEL",
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("GOLF", text)
+            self.assertNotIn("HOTEL", text)
+
+    def test_wrapped_etransfer_name_redacts_continuation_words(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_transaction_table_pdf(
+                source,
+                (
+                    (
+                        "INTERAC e-Transfer From: ALPHA BRAVO",
+                        "CHARLIE",
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("INTERAC e-Transfer From:", text)
+            self.assertIn("ALPHA", text)
+            self.assertNotIn("BRAVO", text)
+            self.assertNotIn("CHARLIE", text)
+
+    def test_offset_side_columns_do_not_end_description_band(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_offset_transaction_table_pdf(
+                source,
+                (
+                    (
+                        100,
+                        (
+                            "INTERAC e-Transfer From: ALPHA BRAVO",
+                            "CHARLIE",
+                        ),
+                    ),
+                    (
+                        130,
+                        (
+                            "PAYROLL DELTA NEXTROW",
+                        ),
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("INTERAC e-Transfer From:", text)
+            self.assertIn("ALPHA", text)
+            self.assertNotIn("BRAVO", text)
+            self.assertNotIn("CHARLIE", text)
+            self.assertIn("PAYROLL", text)
+            self.assertIn("DELTA", text)
+            self.assertIn("NEXTROW", text)
+            self.assertIn("2025-02-01", text)
+            self.assertIn("2025-02-02", text)
+            self.assertIn("-11.00", text)
+            self.assertIn("200.00", text)
+
+    def test_two_continuation_lines_are_redacted(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_transaction_table_pdf(
+                source,
+                (
+                    (
+                        "INTERAC e-Transfer From: INDIA JULIET",
+                        "KILO",
+                        "LIMA",
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("INTERAC e-Transfer From:", text)
+            self.assertIn("INDIA", text)
+            self.assertNotIn("JULIET", text)
+            self.assertNotIn("KILO", text)
+            self.assertNotIn("LIMA", text)
+
+    def test_offset_two_continuation_lines_are_redacted(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_offset_transaction_table_pdf(
+                source,
+                (
+                    (
+                        100,
+                        (
+                            "INTERAC e-Transfer From: INDIA JULIET",
+                            "KILO",
+                            "LIMA",
+                        ),
+                    ),
+                    (
+                        150,
+                        (
+                            "PAYROLL MIKE NEXTROW",
+                        ),
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("INDIA", text)
+            self.assertNotIn("JULIET", text)
+            self.assertNotIn("KILO", text)
+            self.assertNotIn("LIMA", text)
+            self.assertIn("PAYROLL MIKE NEXTROW", text)
+
+    def test_offset_to_prefix_keeps_first_name_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_offset_transaction_table_pdf(
+                source,
+                (
+                    (
+                        100,
+                        (
+                            "INTERAC e-Transfer To: DELTA ECHO",
+                        ),
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("INTERAC e-Transfer To:", text)
+            self.assertIn("DELTA", text)
+            self.assertNotIn("ECHO", text)
+
+    def test_next_wrapped_non_etransfer_row_is_untouched(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_offset_transaction_table_pdf(
+                source,
+                (
+                    (
+                        100,
+                        (
+                            "INTERAC e-Transfer From: PAPA QUEBEC",
+                            "ROMEO",
+                        ),
+                    ),
+                    (
+                        140,
+                        (
+                            "CARD PAYMENT SIERRA",
+                            "TANGO",
+                        ),
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("PAPA", text)
+            self.assertNotIn("QUEBEC", text)
+            self.assertNotIn("ROMEO", text)
+            self.assertIn("CARD PAYMENT SIERRA", text)
+            self.assertIn("TANGO", text)
+
+    def test_final_etransfer_stops_before_closing_balance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_offset_transaction_table_pdf(
+                source,
+                (
+                    (
+                        100,
+                        (
+                            "INTERAC e-Transfer From: UNIFORM VICTOR",
+                            "WHISKEY",
+                        ),
+                    ),
+                ),
+                closing_balance_y=130,
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("UNIFORM", text)
+            self.assertNotIn("VICTOR", text)
+            self.assertNotIn("WHISKEY", text)
+            self.assertIn("Closing Balance", text)
+            self.assertIn("300.00", text)
+
+    def test_etransfer_redaction_stops_before_next_row(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_transaction_table_pdf(
+                source,
+                (
+                    (
+                        "INTERAC e-Transfer From: MIKE NOVEMBER",
+                        "OSCAR",
+                    ),
+                    (
+                        "PAYROLL NOVEMBER NEXTROW",
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                (),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("INTERAC e-Transfer From:", text)
+            self.assertIn("MIKE", text)
+            self.assertNotIn("OSCAR", text)
+            self.assertIn("PAYROLL", text)
+            self.assertIn("NOVEMBER", text)
+            self.assertIn("NEXTROW", text)
+            self.assertIn("2025-01-01", text)
+            self.assertIn("2025-01-02", text)
+            self.assertIn("-10.00", text)
+            self.assertIn("100.00", text)
+
+    def test_non_interac_description_is_unchanged(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_transaction_table_pdf(
+                source,
+                (
+                    (
+                        "CARD PAYMENT PAPA QUEBEC",
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                ("MISSING EXACT TERM",),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("CARD PAYMENT PAPA QUEBEC", text)
+            self.assertEqual(result.redaction_count, 0)
+
+    def test_option_disabled_leaves_etransfer_names_unchanged(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_transaction_table_pdf(
+                source,
+                (
+                    (
+                        "INTERAC e-Transfer From: ROMEO SIERRA TANGO",
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                ("MISSING EXACT TERM",),
+                structured_options=StructuredRedactionOptions(),
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("ROMEO", text)
+            self.assertIn("SIERRA", text)
+            self.assertIn("TANGO", text)
+
+    def test_exact_terms_and_etransfer_rule_work_together(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            root = Path(temporary_folder)
+            editable = root / "editable_input"
+            redacted = root / "redacted_input"
+            source = editable / "account" / "statement.pdf"
+
+            make_transaction_table_pdf(
+                source,
+                (
+                    (
+                        "INTERAC e-Transfer From: UNIFORM VICTOR WHISKEY",
+                    ),
+                    (
+                        "Account token: 1234-5678",
+                    ),
+                ),
+            )
+
+            result = redact_pdf(
+                source,
+                editable,
+                redacted,
+                ("1234-5678",),
+                structured_options=ETRANSFER_OPTION,
+            )
+
+            text = redacted_text(result.destination)
+
+            self.assertIn("INTERAC e-Transfer From:", text)
+            self.assertIn("UNIFORM", text)
+            self.assertNotIn("VICTOR", text)
+            self.assertNotIn("WHISKEY", text)
+            self.assertNotIn("1234-5678", text)
 
 
 if __name__ == "__main__":

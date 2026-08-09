@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -20,6 +21,14 @@ DEFAULT_REDACTION_TERMS_PATH = (
 )
 
 ACCOUNTS_KEY = "accounts"
+TERMS_KEY = "terms"
+ETRANSFER_KEEP_FIRST_NAME_ONLY_KEY = "etransfer_keep_first_name_only"
+
+
+@dataclass(frozen=True)
+class RedactionAccountSettings:
+    terms: tuple[str, ...] = ()
+    etransfer_keep_first_name_only: bool = False
 
 
 def _settings_path(
@@ -44,10 +53,10 @@ def _normalized_terms(
     return normalize_redaction_terms(tuple(terms))
 
 
-def load_redaction_term_accounts(
+def _load_account_settings(
     *,
     settings_path: Path | None = None,
-) -> dict[str, tuple[str, ...]]:
+) -> dict[str, RedactionAccountSettings]:
     path = _settings_path(settings_path)
 
     if not path.exists():
@@ -66,25 +75,44 @@ def load_redaction_term_accounts(
     if not isinstance(accounts, dict):
         return {}
 
-    normalized: dict[str, tuple[str, ...]] = {}
+    normalized: dict[str, RedactionAccountSettings] = {}
 
-    for account_key, terms in accounts.items():
+    for account_key, value in accounts.items():
         if not isinstance(account_key, str):
             continue
 
-        if not isinstance(terms, list):
+        if isinstance(value, list):
+            raw_terms = value
+            etransfer_keep_first_name_only = False
+        elif isinstance(value, dict):
+            raw_terms = value.get(TERMS_KEY, [])
+            if not isinstance(raw_terms, list):
+                continue
+
+            raw_option = value.get(
+                ETRANSFER_KEEP_FIRST_NAME_ONLY_KEY,
+                False,
+            )
+            if not isinstance(raw_option, bool):
+                continue
+
+            etransfer_keep_first_name_only = raw_option
+        else:
             continue
 
-        if any(not isinstance(term, str) for term in terms):
+        if any(not isinstance(term, str) for term in raw_terms):
             continue
 
         try:
             normalized_key = _account_key_text(account_key)
-            normalized_terms = _normalized_terms(terms)
+            normalized_terms = _normalized_terms(raw_terms)
         except Exception:
             continue
 
-        normalized[normalized_key] = normalized_terms
+        normalized[normalized_key] = RedactionAccountSettings(
+            terms=normalized_terms,
+            etransfer_keep_first_name_only=etransfer_keep_first_name_only,
+        )
 
     return {
         account_key: normalized[account_key]
@@ -95,37 +123,74 @@ def load_redaction_term_accounts(
     }
 
 
+def load_redaction_term_accounts(
+    *,
+    settings_path: Path | None = None,
+) -> dict[str, tuple[str, ...]]:
+    accounts = _load_account_settings(
+        settings_path=settings_path,
+    )
+
+    return {
+        account_key: settings.terms
+        for account_key, settings in accounts.items()
+    }
+
+
+def load_redaction_account_settings(
+    account_key: str | Path,
+    *,
+    settings_path: Path | None = None,
+) -> RedactionAccountSettings:
+    normalized_key = _account_key_text(account_key)
+    accounts = _load_account_settings(
+        settings_path=settings_path,
+    )
+
+    return accounts.get(
+        normalized_key,
+        RedactionAccountSettings(),
+    )
+
+
 def load_redaction_terms_for_account(
     account_key: str | Path,
     *,
     settings_path: Path | None = None,
 ) -> tuple[str, ...]:
-    normalized_key = _account_key_text(account_key)
-    accounts = load_redaction_term_accounts(
+    return load_redaction_account_settings(
+        account_key,
         settings_path=settings_path,
-    )
-
-    return accounts.get(normalized_key, ())
+    ).terms
 
 
-def save_redaction_terms_for_account(
+def save_redaction_account_settings(
     account_key: str | Path,
     terms: Iterable[str],
     *,
+    etransfer_keep_first_name_only: bool = False,
     settings_path: Path | None = None,
-) -> tuple[str, ...]:
+) -> RedactionAccountSettings:
     path = _settings_path(settings_path)
     normalized_key = _account_key_text(account_key)
     normalized_terms = _normalized_terms(terms)
-    accounts = load_redaction_term_accounts(
+    accounts = _load_account_settings(
         settings_path=settings_path,
     )
 
-    accounts[normalized_key] = normalized_terms
+    accounts[normalized_key] = RedactionAccountSettings(
+        terms=normalized_terms,
+        etransfer_keep_first_name_only=etransfer_keep_first_name_only,
+    )
 
     payload = {
         ACCOUNTS_KEY: {
-            key: list(accounts[key])
+            key: {
+                TERMS_KEY: list(accounts[key].terms),
+                ETRANSFER_KEEP_FIRST_NAME_ONLY_KEY: (
+                    accounts[key].etransfer_keep_first_name_only
+                ),
+            }
             for key in sorted(
                 accounts,
                 key=str.casefold,
@@ -159,4 +224,17 @@ def save_redaction_terms_for_account(
         temporary.unlink(missing_ok=True)
         raise
 
-    return normalized_terms
+    return accounts[normalized_key]
+
+
+def save_redaction_terms_for_account(
+    account_key: str | Path,
+    terms: Iterable[str],
+    *,
+    settings_path: Path | None = None,
+) -> tuple[str, ...]:
+    return save_redaction_account_settings(
+        account_key,
+        terms,
+        settings_path=settings_path,
+    ).terms
