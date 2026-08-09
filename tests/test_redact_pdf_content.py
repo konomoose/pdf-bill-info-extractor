@@ -447,11 +447,15 @@ class PDFRedactionWorkflowTest(unittest.TestCase):
                 result.stdout,
             )
             self.assertIn(
-                "'Jane Example': 1",
+                "Configured terms: 2",
                 result.stdout,
             )
             self.assertIn(
-                "'1234-5678': 1",
+                "Term 1 matches: 1",
+                result.stdout,
+            )
+            self.assertIn(
+                "Term 2 matches: 1",
                 result.stdout,
             )
             self.assertIn(
@@ -465,6 +469,22 @@ class PDFRedactionWorkflowTest(unittest.TestCase):
             self.assertIn(
                 "Failed: 0",
                 result.stdout,
+            )
+            self.assertNotIn(
+                "Jane Example",
+                result.stdout,
+            )
+            self.assertNotIn(
+                "1234-5678",
+                result.stdout,
+            )
+            self.assertNotIn(
+                "Jane Example",
+                result.stderr,
+            )
+            self.assertNotIn(
+                "1234-5678",
+                result.stderr,
             )
 
 if __name__ == "__main__":

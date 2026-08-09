@@ -1,10 +1,17 @@
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 from src.bill_extractor.institution_collector import (
     InstitutionCollectionResult,
+)
+from src.bill_extractor.pdf_preparation import (
+    PDFPreparationResult,
+)
+from src.bill_extractor.profile_loader import (
+    ExtractionProfile,
 )
 from src.bill_extractor.workflow import (
     WorkflowFileResult,
@@ -263,6 +270,193 @@ class GUIWorkflowTest(unittest.TestCase):
         self.assertIn(
             "Stale managed files removed: 1",
             text,
+        )
+
+    def test_preparation_result_is_aggregate_and_private(
+        self,
+    ) -> None:
+        result = PDFPreparationResult(
+            account_key="tangerine_chequing",
+            profile_id=None,
+            profile_display_name=None,
+            source_folder=Path(
+                "source_input/tangerine_chequing"
+            ),
+            editable_folder=Path(
+                "editable_input/tangerine_chequing"
+            ),
+            redacted_folder=Path(
+                "redacted_input/tangerine_chequing"
+            ),
+            source_pdf_count=3,
+            security_created_count=2,
+            security_skipped_count=1,
+            security_password_required_count=0,
+            security_failed_count=0,
+            redaction_created_count=2,
+            redaction_already_clean_count=1,
+            redaction_skipped_count=0,
+            redaction_failed_count=0,
+        )
+
+        text = "\n".join(
+            GUI_MODULE
+            .pdf_preparation_result_messages(result)
+        )
+
+        self.assertIn(
+            "PDF PREPARATION RESULTS",
+            text,
+        )
+        self.assertIn(
+            "Preparation account: tangerine_chequing",
+            text,
+        )
+        self.assertIn(
+            "Source PDFs found: 3",
+            text,
+        )
+        self.assertIn(
+            "Security removal:",
+            text,
+        )
+        self.assertIn(
+            "Password required: 0",
+            text,
+        )
+        self.assertIn(
+            "Redaction:",
+            text,
+        )
+        self.assertIn(
+            "Already clean: 1",
+            text,
+        )
+        self.assertIn(
+            "Redacted folder:",
+            text,
+        )
+        self.assertNotIn(
+            "Jane Example",
+            text,
+        )
+        self.assertNotIn(
+            "secret-password",
+            text,
+        )
+
+    def test_preparation_account_suggestions_come_from_profiles(
+        self,
+    ) -> None:
+        profiles = (
+            ExtractionProfile(
+                profile_id="test_v1",
+                display_name="Test Profile",
+                profile_version=1,
+                institution="Test Bank",
+                document_type="bank_account_statement",
+                parser="rbc_chequing_account",
+                input_folder=Path(
+                    "editable_input/test_account"
+                ),
+                output_folder=Path(
+                    "csv_output/test_account"
+                ),
+                file_pattern="*.pdf",
+                recursive=True,
+                preserve_subfolders=True,
+                required_headers=("Date",),
+                excluded_page_phrases=(),
+                line_tolerance=2.5,
+                continuation_gap=18.0,
+                source_path=Path(
+                    "config/profiles/test.json"
+                ),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            suggestions = (
+                GUI_MODULE
+                .preparation_account_suggestions(
+                    profiles,
+                    settings_path=(
+                        Path(temporary_folder)
+                        / "missing-preparation.local.json"
+                    ),
+                )
+            )
+
+        self.assertEqual(
+            suggestions,
+            ["test_account"],
+        )
+        self.assertNotIn(
+            "tangerine_chequing",
+            suggestions,
+        )
+
+    def test_preparation_account_suggestions_include_saved_keys(
+        self,
+    ) -> None:
+        profiles = (
+            ExtractionProfile(
+                profile_id="test_v1",
+                display_name="Test Profile",
+                profile_version=1,
+                institution="Test Bank",
+                document_type="bank_account_statement",
+                parser="rbc_chequing_account",
+                input_folder=Path(
+                    "editable_input/test_account"
+                ),
+                output_folder=Path(
+                    "csv_output/test_account"
+                ),
+                file_pattern="*.pdf",
+                recursive=True,
+                preserve_subfolders=True,
+                required_headers=("Date",),
+                excluded_page_phrases=(),
+                line_tolerance=2.5,
+                continuation_gap=18.0,
+                source_path=Path(
+                    "config/profiles/test.json"
+                ),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            settings_path = (
+                Path(temporary_folder)
+                / "preparation.local.json"
+            )
+            settings_path.write_text(
+                (
+                    "{\n"
+                    '  "preparation_accounts": [\n'
+                    '    "tangerine_chequing",\n'
+                    '    "test_account"\n'
+                    "  ]\n"
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+
+            suggestions = (
+                GUI_MODULE
+                .preparation_account_suggestions(
+                    profiles,
+                    settings_path=settings_path,
+                )
+            )
+
+        self.assertEqual(
+            suggestions,
+            [
+                "tangerine_chequing",
+                "test_account",
+            ],
         )
 
 

@@ -20,6 +20,17 @@ from src.bill_extractor.profile_loader import (
     ProfileError,
     discover_profiles,
 )
+from src.bill_extractor.pdf_preparation import (
+    PDFPreparationError,
+    PDFPreparationResult,
+    account_key_for_profile,
+    preparation_folders_for_account,
+    prepare_account_pdfs,
+)
+from src.bill_extractor.preparation_settings import (
+    load_preparation_account_keys,
+    remember_preparation_account_key,
+)
 from src.bill_extractor.workflow import (
     WorkflowError,
     WorkflowResult,
@@ -157,11 +168,83 @@ def institution_collection_result_messages(
     ]
 
 
+def pdf_preparation_result_messages(
+    result: PDFPreparationResult,
+) -> list[str]:
+    """Build privacy-safe GUI messages for PDF preparation."""
+    messages = [
+        "",
+        "PDF PREPARATION RESULTS",
+        f"Preparation account: {result.account_key}",
+        f"Source PDFs found: {result.source_pdf_count}",
+        "",
+        "Security removal:",
+        f"Created: {result.security_created_count}",
+        f"Skipped: {result.security_skipped_count}",
+        (
+            "Password required: "
+            f"{result.security_password_required_count}"
+        ),
+        f"Failed: {result.security_failed_count}",
+        "",
+        "Redaction:",
+        f"Created: {result.redaction_created_count}",
+        f"Already clean: {result.redaction_already_clean_count}",
+        f"Skipped: {result.redaction_skipped_count}",
+        f"Failed: {result.redaction_failed_count}",
+        "",
+        f"Redacted folder: {result.redacted_folder}",
+        "Review the redacted PDFs before sharing them.",
+    ]
+
+    if result.security_password_required_count:
+        messages.extend(
+            [
+                "",
+                (
+                    "One or more PDFs require a password. Enter the PDF "
+                    "password and run Prepare PDFs again."
+                ),
+            ]
+        )
+
+    return messages
+
+
+def preparation_account_suggestions(
+    profiles: tuple[ExtractionProfile, ...],
+    *,
+    settings_path: Path | None = None,
+) -> list[str]:
+    suggestions: set[str] = set()
+
+    for profile in profiles:
+        try:
+            account_key = account_key_for_profile(
+                profile
+            )
+        except PDFPreparationError:
+            continue
+
+        suggestions.add(account_key.as_posix())
+
+    suggestions.update(
+        load_preparation_account_keys(
+            settings_path=settings_path,
+        )
+    )
+
+    return sorted(
+        suggestions,
+        key=str.casefold,
+    )
+
+
 class PDFBillExtractorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("PDF Bill Info Extractor")
-        self.root.geometry("980x800")
+        self.root.geometry("980x900")
 
         try:
             profiles = discover_profiles()
@@ -179,6 +262,7 @@ class PDFBillExtractorApp:
             profile.display_name: profile for profile in profiles
         }
         self.active_profile = profiles[0]
+        self.preparation_account_was_edited = False
 
         self.setup_ui()
         self._apply_profile(self.active_profile)
@@ -190,7 +274,7 @@ class PDFBillExtractorApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(10, weight=1)
+        main_frame.rowconfigure(11, weight=1)
 
         ttk.Label(
             main_frame,
@@ -219,12 +303,143 @@ class PDFBillExtractorApp:
         profile_combo.grid(row=2, column=1, sticky=tk.W, padx=5)
         profile_combo.bind("<<ComboboxSelected>>", self._profile_selected)
 
+        preparation_frame = ttk.LabelFrame(
+            main_frame,
+            text="PDF Preparation",
+            padding="5",
+        )
+        preparation_frame.grid(
+            row=3,
+            column=0,
+            columnspan=3,
+            sticky=(tk.W, tk.E),
+            pady=(8, 6),
+        )
+        preparation_frame.columnconfigure(1, weight=1)
+
+        self.preparation_account_var = tk.StringVar()
+        self.prep_source_var = tk.StringVar()
+        self.prep_editable_var = tk.StringVar()
+        self.prep_redacted_var = tk.StringVar()
+
+        ttk.Label(
+            preparation_frame,
+            text="Preparation Account:",
+        ).grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.preparation_account_combo = ttk.Combobox(
+            preparation_frame,
+            textvariable=self.preparation_account_var,
+            values=preparation_account_suggestions(
+                self.profiles
+            ),
+            state="normal",
+            width=44,
+        )
+        self.preparation_account_combo.grid(
+            row=0,
+            column=1,
+            sticky=tk.W,
+            padx=5,
+            pady=2,
+        )
+        self.preparation_account_combo.bind(
+            "<<ComboboxSelected>>",
+            self._preparation_account_changed,
+        )
+        self.preparation_account_combo.bind(
+            "<KeyRelease>",
+            self._preparation_account_changed,
+        )
+        self.preparation_account_combo.bind(
+            "<FocusOut>",
+            self._preparation_account_changed,
+        )
+
+        ttk.Label(preparation_frame, text="Source:").grid(
+            row=1, column=0, sticky=tk.W, pady=2
+        )
+        ttk.Label(
+            preparation_frame,
+            textvariable=self.prep_source_var,
+            wraplength=760,
+        ).grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5)
+
+        ttk.Label(preparation_frame, text="Editable:").grid(
+            row=2, column=0, sticky=tk.W, pady=2
+        )
+        ttk.Label(
+            preparation_frame,
+            textvariable=self.prep_editable_var,
+            wraplength=760,
+        ).grid(row=2, column=1, sticky=(tk.W, tk.E), padx=5)
+
+        ttk.Label(preparation_frame, text="Redacted:").grid(
+            row=3, column=0, sticky=tk.W, pady=2
+        )
+        ttk.Label(
+            preparation_frame,
+            textvariable=self.prep_redacted_var,
+            wraplength=760,
+        ).grid(row=3, column=1, sticky=(tk.W, tk.E), padx=5)
+
+        ttk.Label(
+            preparation_frame,
+            text="Redaction terms - one exact value per line:",
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(6, 2))
+        self.redaction_terms_text = scrolledtext.ScrolledText(
+            preparation_frame,
+            width=78,
+            height=5,
+        )
+        self.redaction_terms_text.grid(
+            row=5,
+            column=0,
+            columnspan=2,
+            sticky=(tk.W, tk.E),
+        )
+
+        ttk.Label(
+            preparation_frame,
+            text="PDF Password (optional):",
+        ).grid(row=6, column=0, sticky=tk.W, pady=(6, 2))
+        self.pdf_password_var = tk.StringVar()
+        self.pdf_password_entry = ttk.Entry(
+            preparation_frame,
+            textvariable=self.pdf_password_var,
+            show="*",
+            width=32,
+        )
+        self.pdf_password_entry.grid(
+            row=6,
+            column=1,
+            sticky=tk.W,
+            padx=5,
+            pady=(6, 2),
+        )
+
+        self.prepare_btn = ttk.Button(
+            preparation_frame,
+            text="Prepare PDFs",
+            command=self.start_preparation,
+        )
+        self.prepare_btn.grid(
+            row=7,
+            column=0,
+            sticky=tk.W,
+            pady=(8, 2),
+        )
+        ttk.Label(
+            preparation_frame,
+            text="Review redacted PDFs before sharing them outside this computer.",
+            wraplength=760,
+        ).grid(row=7, column=1, sticky=tk.W, padx=5, pady=(8, 2))
+
         ttk.Label(main_frame, text="Input Mode:").grid(
-            row=3, column=0, sticky=tk.W, pady=5
+            row=4, column=0, sticky=tk.W, pady=5
         )
         self.input_mode_var = tk.StringVar(value="file")
         input_mode_frame = ttk.Frame(main_frame)
-        input_mode_frame.grid(row=3, column=1, columnspan=2, sticky=tk.W)
+        input_mode_frame.grid(row=4, column=1, columnspan=2, sticky=tk.W)
         ttk.Radiobutton(
             input_mode_frame,
             text="Single PDF",
@@ -239,43 +454,43 @@ class PDFBillExtractorApp:
         ).grid(row=0, column=1)
 
         ttk.Label(main_frame, text="PDF File:").grid(
-            row=4, column=0, sticky=tk.W, pady=5
+            row=5, column=0, sticky=tk.W, pady=5
         )
         self.pdf_file_var = tk.StringVar()
         ttk.Entry(main_frame, textvariable=self.pdf_file_var, width=60).grid(
-            row=4, column=1, sticky=(tk.W, tk.E), padx=5
-        )
-        ttk.Button(main_frame, text="Browse", command=self.browse_pdf_file).grid(
-            row=4, column=2, padx=5
-        )
-
-        ttk.Label(main_frame, text="PDF Folder:").grid(
-            row=5, column=0, sticky=tk.W, pady=5
-        )
-        self.pdf_folder_var = tk.StringVar()
-        ttk.Entry(main_frame, textvariable=self.pdf_folder_var, width=60).grid(
             row=5, column=1, sticky=(tk.W, tk.E), padx=5
         )
-        ttk.Button(main_frame, text="Browse", command=self.browse_pdf_folder).grid(
+        ttk.Button(main_frame, text="Browse", command=self.browse_pdf_file).grid(
             row=5, column=2, padx=5
         )
 
-        ttk.Label(main_frame, text="Output Folder:").grid(
+        ttk.Label(main_frame, text="PDF Folder:").grid(
             row=6, column=0, sticky=tk.W, pady=5
+        )
+        self.pdf_folder_var = tk.StringVar()
+        ttk.Entry(main_frame, textvariable=self.pdf_folder_var, width=60).grid(
+            row=6, column=1, sticky=(tk.W, tk.E), padx=5
+        )
+        ttk.Button(main_frame, text="Browse", command=self.browse_pdf_folder).grid(
+            row=6, column=2, padx=5
+        )
+
+        ttk.Label(main_frame, text="Output Folder:").grid(
+            row=7, column=0, sticky=tk.W, pady=5
         )
         self.output_folder_var = tk.StringVar()
         ttk.Entry(main_frame, textvariable=self.output_folder_var, width=60).grid(
-            row=6, column=1, sticky=(tk.W, tk.E), padx=5
+            row=7, column=1, sticky=(tk.W, tk.E), padx=5
         )
         ttk.Button(main_frame, text="Browse", command=self.browse_output_folder).grid(
-            row=6, column=2, padx=5
+            row=7, column=2, padx=5
         )
 
         button_frame = ttk.Frame(
             main_frame
         )
         button_frame.grid(
-            row=7,
+            row=8,
             column=0,
             columnspan=3,
             pady=10,
@@ -307,18 +522,18 @@ class PDFBillExtractorApp:
             main_frame,
             textvariable=self.folder_mode_info_var,
             wraplength=820,
-        ).grid(row=8, column=0, columnspan=3, pady=(0, 5))
+        ).grid(row=9, column=0, columnspan=3, pady=(0, 5))
 
         self.progress = ttk.Progressbar(main_frame, mode="indeterminate")
         self.progress.grid(
-            row=9, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5
+            row=10, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5
         )
 
         results_frame = ttk.LabelFrame(
             main_frame, text="Processing Results", padding="5"
         )
         results_frame.grid(
-            row=10,
+            row=11,
             column=0,
             columnspan=3,
             sticky=(tk.W, tk.E, tk.N, tk.S),
@@ -343,6 +558,37 @@ class PDFBillExtractorApp:
     def _profile_selected(self, _event: object | None = None) -> None:
         self._apply_profile(self.profiles_by_name[self.profile_var.get()])
 
+    def _preparation_account_changed(
+        self,
+        _event: object | None = None,
+    ) -> None:
+        self.preparation_account_was_edited = True
+        self._update_preparation_paths()
+
+    def _update_preparation_paths(self) -> None:
+        account_key = self.preparation_account_var.get().strip()
+
+        if not account_key:
+            self.prep_source_var.set("")
+            self.prep_editable_var.set("")
+            self.prep_redacted_var.set("")
+            return
+
+        try:
+            folders = preparation_folders_for_account(
+                account_key
+            )
+        except PDFPreparationError as exc:
+            unavailable = f"Unavailable: {exc}"
+            self.prep_source_var.set(unavailable)
+            self.prep_editable_var.set(unavailable)
+            self.prep_redacted_var.set(unavailable)
+            return
+
+        self.prep_source_var.set(str(folders.source_folder))
+        self.prep_editable_var.set(str(folders.editable_folder))
+        self.prep_redacted_var.set(str(folders.redacted_folder))
+
     def _apply_profile(self, profile: ExtractionProfile) -> None:
         self.active_profile = profile
 
@@ -354,6 +600,20 @@ class PDFBillExtractorApp:
         self.pdf_file_var.set("")
         self.pdf_folder_var.set(str(input_folder))
         self.output_folder_var.set(str(output_folder))
+
+        if not self.preparation_account_was_edited:
+            try:
+                account_key = account_key_for_profile(
+                    profile
+                )
+            except PDFPreparationError:
+                self.preparation_account_var.set("")
+            else:
+                self.preparation_account_var.set(
+                    account_key.as_posix()
+                )
+
+        self._update_preparation_paths()
 
         headers = ", ".join(profile.required_headers)
         self.profile_info_var.set(
@@ -402,6 +662,113 @@ class PDFBillExtractorApp:
         )
         if folder:
             self.output_folder_var.set(folder)
+
+    def _redaction_terms(self) -> tuple[str, ...]:
+        raw_text = self.redaction_terms_text.get(
+            "1.0",
+            tk.END,
+        )
+        terms: list[str] = []
+        seen: set[str] = set()
+
+        for line in raw_text.splitlines():
+            term = line.strip()
+
+            if not term:
+                continue
+
+            key = term.casefold()
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            terms.append(term)
+
+        return tuple(terms)
+
+    def start_preparation(self) -> None:
+        terms = self._redaction_terms()
+
+        if not terms:
+            messagebox.showerror(
+                "Error",
+                "Enter at least one exact redaction term.",
+            )
+            return
+
+        account_key = self.preparation_account_var.get().strip()
+        if not account_key:
+            messagebox.showerror(
+                "PDF Preparation Error",
+                "Enter a preparation account key.",
+            )
+            return
+
+        password = self.pdf_password_var.get()
+        password_arg = password if password else None
+
+        try:
+            folders = preparation_folders_for_account(
+                account_key
+            )
+        except PDFPreparationError as exc:
+            messagebox.showerror(
+                "PDF Preparation Error",
+                str(exc),
+            )
+            return
+
+        try:
+            remember_preparation_account_key(
+                folders.account_key.as_posix()
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "PDF Preparation Error",
+                (
+                    "Could not save the preparation account key: "
+                    f"{exc}"
+                ),
+            )
+            return
+
+        self.preparation_account_combo.configure(
+            values=preparation_account_suggestions(
+                self.profiles
+            )
+        )
+
+        self._set_buttons_state(tk.DISABLED)
+        self.progress.start(10)
+        self.status_var.set("Preparing PDFs...")
+        self.results_text.delete("1.0", tk.END)
+        self._append_result(
+            f"Preparation account: {folders.account_key.as_posix()}\n"
+        )
+        self._append_result(
+            f"Source folder: {folders.source_folder}\n"
+        )
+        self._append_result(
+            f"Editable folder: {folders.editable_folder}\n"
+        )
+        self._append_result(
+            f"Redacted folder: {folders.redacted_folder}\n"
+        )
+        self._append_result(
+            "Preparing PDFs. Extraction will not run automatically.\n"
+        )
+
+        worker = threading.Thread(
+            target=self._preparation_worker,
+            args=(
+                folders.account_key.as_posix(),
+                terms,
+                password_arg,
+            ),
+            daemon=True,
+        )
+        worker.start()
 
     def start_processing(self) -> None:
         input_mode = self.input_mode_var.get()
@@ -511,6 +878,45 @@ class PDFBillExtractorApp:
             self.root.after(
                 0,
                 self._processing_failed,
+                f"Unexpected error: {exc}",
+            )
+
+    def _preparation_worker(
+        self,
+        account_key: str,
+        terms: tuple[str, ...],
+        password: str | None,
+    ) -> None:
+        try:
+            result = prepare_account_pdfs(
+                account_key,
+                terms,
+                password=password,
+            )
+
+            self.root.after(
+                0,
+                self._preparation_succeeded,
+                result,
+            )
+
+        except PDFPreparationError as exc:
+            logger.exception(
+                "PDF preparation failed"
+            )
+            self.root.after(
+                0,
+                self._preparation_failed,
+                str(exc),
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Unexpected PDF preparation error"
+            )
+            self.root.after(
+                0,
+                self._preparation_failed,
                 f"Unexpected error: {exc}",
             )
 
@@ -634,6 +1040,71 @@ class PDFBillExtractorApp:
             completion_message,
         )
 
+    def _preparation_succeeded(
+        self,
+        result: PDFPreparationResult,
+    ) -> None:
+        for message in pdf_preparation_result_messages(
+            result
+        ):
+            self._append_result(
+                f"{message}\n"
+            )
+
+        self.pdf_password_var.set("")
+        self.progress.stop()
+        self._set_buttons_state(tk.NORMAL)
+
+        self.status_var.set(
+            "Done: prepared "
+            f"{result.redaction_created_count} redacted PDFs"
+        )
+
+        completion_message = (
+            f"Source PDFs found: {result.source_pdf_count}\n"
+            "Security removal created: "
+            f"{result.security_created_count}\n"
+            "Security removal skipped: "
+            f"{result.security_skipped_count}\n"
+            "Password required: "
+            f"{result.security_password_required_count}\n"
+            "Security removal failed: "
+            f"{result.security_failed_count}\n"
+            "Redaction created: "
+            f"{result.redaction_created_count}\n"
+            "Redaction already clean: "
+            f"{result.redaction_already_clean_count}\n"
+            "Redaction skipped: "
+            f"{result.redaction_skipped_count}\n"
+            "Redaction failed: "
+            f"{result.redaction_failed_count}\n"
+            f"Redacted folder: {result.redacted_folder}\n"
+            "Review the redacted PDFs before sharing them."
+        )
+
+        if (
+            result.security_password_required_count
+            or result.security_failed_count
+            or result.redaction_failed_count
+        ):
+            messagebox.showwarning(
+                "PDF Preparation Complete with Errors",
+                completion_message,
+            )
+        else:
+            messagebox.showinfo(
+                "PDF Preparation Complete",
+                completion_message,
+            )
+
+    def _preparation_failed(self, error_message: str) -> None:
+        self.pdf_password_var.set("")
+        self._append_result(f"\nError: {error_message}\n")
+        self.status_var.set("PDF preparation failed")
+        self.progress.stop()
+        self._set_buttons_state(tk.NORMAL)
+        messagebox.showerror("PDF Preparation Error", error_message)
+
     def _processing_failed(self, error_message: str) -> None:
         self._append_result(f"\nError: {error_message}\n")
         self.status_var.set("Processing failed")
@@ -642,6 +1113,7 @@ class PDFBillExtractorApp:
         messagebox.showerror("Error", error_message)
 
     def _set_buttons_state(self, state: str) -> None:
+        self.prepare_btn.config(state=state)
         self.process_btn.config(state=state)
         self.collect_btn.config(state=state)
 
@@ -659,6 +1131,7 @@ def main() -> None:
         ProfileError,
         WorkflowError,
         InstitutionCollectionError,
+        PDFPreparationError,
     ) as exc:
         logger.error("Application startup failed: %s", exc)
         messagebox.showerror("Startup Error", str(exc))
