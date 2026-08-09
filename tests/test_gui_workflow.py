@@ -2,7 +2,9 @@ import importlib.util
 from pathlib import Path
 import sys
 import tempfile
+import tkinter as tk
 import unittest
+from unittest.mock import patch
 
 from src.bill_extractor.institution_collector import (
     InstitutionCollectionResult,
@@ -49,7 +51,174 @@ sys.modules[SPEC.name] = GUI_MODULE
 SPEC.loader.exec_module(GUI_MODULE)
 
 
+def make_profile(
+    root: Path,
+) -> ExtractionProfile:
+    return ExtractionProfile(
+        profile_id="test_v1",
+        display_name="Test Profile",
+        profile_version=1,
+        institution="Test Bank",
+        document_type="bank_account_statement",
+        parser="rbc_chequing_account",
+        input_folder=root / "editable",
+        output_folder=root / "csv",
+        file_pattern="*.pdf",
+        recursive=True,
+        preserve_subfolders=True,
+        required_headers=("Date",),
+        excluded_page_phrases=(),
+        line_tolerance=2.5,
+        continuation_gap=18.0,
+        source_path=Path("config/profiles/test.json"),
+    )
+
+
+def create_test_app(
+    test_case: unittest.TestCase,
+):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        test_case.skipTest(f"Tk display is not available: {exc}")
+
+    root.withdraw()
+    test_case.addCleanup(root.destroy)
+
+    temporary_folder = tempfile.TemporaryDirectory()
+    test_case.addCleanup(temporary_folder.cleanup)
+    profile = make_profile(Path(temporary_folder.name))
+
+    patches = [
+        patch.object(
+            GUI_MODULE,
+            "discover_profiles",
+            return_value=(profile,),
+        ),
+        patch.object(
+            GUI_MODULE,
+            "preparation_account_suggestions",
+            return_value=("test_account",),
+        ),
+        patch.object(
+            GUI_MODULE,
+            "load_redaction_account_settings",
+            side_effect=RuntimeError("synthetic settings unavailable"),
+        ),
+    ]
+
+    for active_patch in patches:
+        active_patch.start()
+        test_case.addCleanup(active_patch.stop)
+
+    app = GUI_MODULE.PDFBillExtractorApp(root)
+    root.update_idletasks()
+    return root, app
+
+
+def is_descendant(
+    widget: tk.Widget,
+    ancestor: tk.Widget,
+) -> bool:
+    current = widget
+
+    while current is not None:
+        if current is ancestor:
+            return True
+
+        current = current.master
+
+    return False
+
+
 class GUIWorkflowTest(unittest.TestCase):
+    def test_initial_window_geometry_is_capped_for_small_screens(
+        self,
+    ) -> None:
+        self.assertEqual(
+            GUI_MODULE.initial_window_geometry(1366, 768),
+            "980x668",
+        )
+        self.assertEqual(
+            GUI_MODULE.initial_window_geometry(1280, 720),
+            "980x620",
+        )
+
+    def test_layout_uses_separate_control_and_result_panes(
+        self,
+    ) -> None:
+        _root, app = create_test_app(self)
+
+        panes = tuple(app.main_paned.panes())
+
+        self.assertEqual(len(panes), 2)
+        self.assertEqual(
+            panes[0],
+            str(app.controls_scroll_container),
+        )
+        self.assertEqual(
+            panes[1],
+            str(app.results_frame),
+        )
+        self.assertIs(
+            app.results_frame.master,
+            app.main_paned,
+        )
+        self.assertTrue(
+            is_descendant(
+                app.results_text,
+                app.results_frame,
+            ),
+        )
+        self.assertFalse(
+            is_descendant(
+                app.results_text,
+                app.controls_scroll_container,
+            ),
+        )
+        self.assertFalse(
+            is_descendant(
+                app.results_text,
+                app.controls_frame,
+            ),
+        )
+        self.assertTrue(
+            is_descendant(
+                app.results_text.vbar,
+                app.results_frame,
+            ),
+        )
+        self.assertIsNot(
+            app.results_frame,
+            app.controls_scroll_container,
+        )
+
+    def test_controls_scroll_independently_from_results(
+        self,
+    ) -> None:
+        _root, app = create_test_app(self)
+
+        self.assertIs(
+            app.controls_canvas.master,
+            app.controls_scroll_container,
+        )
+        self.assertIs(
+            app.controls_scrollbar.master,
+            app.controls_scroll_container,
+        )
+        self.assertIs(
+            app.controls_frame.master,
+            app.controls_canvas,
+        )
+        self.assertEqual(
+            int(app.results_text.cget("height")),
+            GUI_MODULE.RESULTS_TEXT_MIN_LINES,
+        )
+        self.assertIsNot(
+            app.results_text.master,
+            app.controls_scroll_container,
+        )
+
     def test_workflow_messages_include_all_outputs(
         self,
     ) -> None:

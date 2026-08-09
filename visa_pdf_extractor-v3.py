@@ -50,6 +50,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DEFAULT_WINDOW_WIDTH = 980
+DEFAULT_WINDOW_HEIGHT = 900
+WINDOW_SCREEN_MARGIN_WIDTH = 80
+WINDOW_SCREEN_MARGIN_HEIGHT = 100
+MIN_WINDOW_WIDTH = 760
+MIN_WINDOW_HEIGHT = 520
+RESULTS_PANE_MIN_HEIGHT = 180
+RESULTS_TEXT_MIN_LINES = 10
+
+
+def initial_window_geometry(
+    screen_width: int,
+    screen_height: int,
+) -> str:
+    available_width = max(
+        320,
+        screen_width - WINDOW_SCREEN_MARGIN_WIDTH,
+    )
+    available_height = max(
+        320,
+        screen_height - WINDOW_SCREEN_MARGIN_HEIGHT,
+    )
+
+    width = min(
+        DEFAULT_WINDOW_WIDTH,
+        available_width,
+    )
+    height = min(
+        DEFAULT_WINDOW_HEIGHT,
+        available_height,
+    )
+
+    if available_width >= MIN_WINDOW_WIDTH:
+        width = max(
+            width,
+            MIN_WINDOW_WIDTH,
+        )
+    if available_height >= MIN_WINDOW_HEIGHT:
+        height = max(
+            height,
+            MIN_WINDOW_HEIGHT,
+        )
+
+    return f"{int(width)}x{int(height)}"
+
 
 def workflow_result_messages(
     result: WorkflowResult,
@@ -260,7 +305,17 @@ class PDFBillExtractorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("PDF Bill Info Extractor")
-        self.root.geometry("980x900")
+        self.root.geometry(
+            initial_window_geometry(
+                self.root.winfo_screenwidth(),
+                self.root.winfo_screenheight(),
+            )
+        )
+        self.root.minsize(
+            MIN_WINDOW_WIDTH,
+            MIN_WINDOW_HEIGHT,
+        )
+        self.root.resizable(True, True)
 
         try:
             profiles = discover_profiles()
@@ -284,13 +339,60 @@ class PDFBillExtractorApp:
         self._apply_profile(self.active_profile)
 
     def setup_ui(self) -> None:
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=0)
+
+        outer_frame = ttk.Frame(self.root, padding="10")
+        outer_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        outer_frame.columnconfigure(0, weight=1)
+        outer_frame.rowconfigure(0, weight=1)
+
+        self.main_paned = ttk.PanedWindow(
+            outer_frame,
+            orient=tk.VERTICAL,
+        )
+        self.main_paned.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        self.controls_scroll_container = ttk.Frame(self.main_paned)
+        self.controls_scroll_container.columnconfigure(0, weight=1)
+        self.controls_scroll_container.rowconfigure(0, weight=1)
+
+        self.controls_canvas = tk.Canvas(
+            self.controls_scroll_container,
+            highlightthickness=0,
+        )
+        self.controls_canvas.grid(
+            row=0,
+            column=0,
+            sticky=(tk.W, tk.E, tk.N, tk.S),
+        )
+
+        self.controls_scrollbar = ttk.Scrollbar(
+            self.controls_scroll_container,
+            orient=tk.VERTICAL,
+            command=self.controls_canvas.yview,
+        )
+        self.controls_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.controls_canvas.configure(yscrollcommand=self.controls_scrollbar.set)
+
+        main_frame = ttk.Frame(self.controls_canvas)
+        self.controls_frame = main_frame
+        self.controls_frame_window = self.controls_canvas.create_window(
+            (0, 0),
+            window=main_frame,
+            anchor=tk.NW,
+        )
+        main_frame.bind(
+            "<Configure>",
+            self._controls_frame_configured,
+        )
+        self.controls_canvas.bind(
+            "<Configure>",
+            self._controls_canvas_configured,
+        )
+
         main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(11, weight=1)
 
         ttk.Label(
             main_frame,
@@ -561,23 +663,29 @@ class PDFBillExtractorApp:
             row=10, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5
         )
 
-        results_frame = ttk.LabelFrame(
-            main_frame, text="Processing Results", padding="5"
+        self.results_frame = ttk.LabelFrame(
+            self.main_paned, text="Processing Results", padding="5"
         )
-        results_frame.grid(
-            row=11,
-            column=0,
-            columnspan=3,
-            sticky=(tk.W, tk.E, tk.N, tk.S),
-            pady=10,
+        self.results_frame.configure(
+            height=RESULTS_PANE_MIN_HEIGHT,
         )
-        results_frame.columnconfigure(0, weight=1)
-        results_frame.rowconfigure(0, weight=1)
+        self.results_frame.columnconfigure(0, weight=1)
+        self.results_frame.rowconfigure(0, weight=1)
 
         self.results_text = scrolledtext.ScrolledText(
-            results_frame, width=90, height=22
+            self.results_frame, width=90, height=RESULTS_TEXT_MIN_LINES
         )
         self.results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        self.main_paned.add(
+            self.controls_scroll_container,
+            weight=0,
+        )
+        self.main_paned.add(
+            self.results_frame,
+            weight=1,
+        )
+        self.root.after_idle(self._set_initial_pane_sizes)
 
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(
@@ -585,7 +693,46 @@ class PDFBillExtractorApp:
             textvariable=self.status_var,
             relief=tk.SUNKEN,
             anchor=tk.W,
-        ).grid(row=7, column=0, sticky=(tk.W, tk.E))
+        ).grid(row=1, column=0, sticky=(tk.W, tk.E))
+
+    def _controls_frame_configured(
+        self,
+        _event: object | None = None,
+    ) -> None:
+        self.controls_canvas.configure(
+            scrollregion=self.controls_canvas.bbox("all"),
+        )
+
+    def _controls_canvas_configured(
+        self,
+        event: tk.Event,
+    ) -> None:
+        self.controls_canvas.itemconfigure(
+            self.controls_frame_window,
+            width=event.width,
+        )
+
+    def _set_initial_pane_sizes(self) -> None:
+        height = self.main_paned.winfo_height()
+        if height <= RESULTS_PANE_MIN_HEIGHT:
+            return
+
+        results_height = min(
+            360,
+            max(
+                RESULTS_PANE_MIN_HEIGHT,
+                height // 3,
+            ),
+        )
+        sash_position = max(
+            120,
+            height - results_height,
+        )
+
+        try:
+            self.main_paned.sashpos(0, sash_position)
+        except tk.TclError:
+            return
 
     def _profile_selected(self, _event: object | None = None) -> None:
         self._apply_profile(self.profiles_by_name[self.profile_var.get()])
