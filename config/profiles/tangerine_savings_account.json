@@ -1,0 +1,30 @@
+{
+  "profile_id": "tangerine_savings_account_v1",
+  "display_name": "Tangerine Savings Account",
+  "profile_version": 1,
+  "institution": "Tangerine Bank",
+  "document_type": "bank_account_statement",
+  "parser": "tangerine_savings_account",
+  "input_folder": "editable_input/tangerine_savings",
+  "output_folder": "csv_output/tangerine_savings",
+  "file_pattern": "*.pdf",
+  "recursive": true,
+  "preserve_subfolders": true,
+  "required_headers": [
+    "Date",
+    "Description",
+    "Withdrawals ($)",
+    "Deposits ($)",
+    "Balance ($)"
+  ],
+  "excluded_page_phrases": [],
+  "line_tolerance": 2.5,
+  "continuation_gap": 18.0,
+  "normalized_output_columns": [
+    "transaction_date",
+    "description",
+    "withdrawal",
+    "deposit",
+    "balance"
+  ]
+}

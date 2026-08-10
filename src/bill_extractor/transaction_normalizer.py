@@ -89,6 +89,13 @@ PROFILE_MAPPINGS = {
         "deposit": "Deposits ($)",
         "balance": "Balance ($)",
     },
+    "tangerine_savings_account_v1": {
+        "transaction_date": "Date",
+        "description": "Description",
+        "withdrawal": "Withdrawals ($)",
+        "deposit": "Deposits ($)",
+        "balance": "Balance ($)",
+    },
     "simplii_loc_v1": {
         "transaction_date": "Trans. date",
         "effective_date": "Eff. date",
