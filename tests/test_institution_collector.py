@@ -9,6 +9,8 @@ import pandas as pd
 
 from src.bill_extractor.institution_collector import (
     InstitutionCollectionError,
+    account_slug,
+    collect_profile_account_statement_csvs,
     collect_institution_statement_csvs,
     profiles_for_institution,
 )
@@ -171,6 +173,740 @@ COMBINED_COLUMNS = [
     "interest_fees_insurance",
     "balance",
 ]
+
+PROJECTED_COLUMNS = [
+    "transaction_date",
+    "description",
+    "withdrawal",
+    "deposit",
+    "balance",
+]
+
+
+def projected_bytes(
+    rows: list[dict[str, str]],
+) -> bytes:
+    frame = pd.DataFrame(
+        rows,
+        columns=PROJECTED_COLUMNS,
+    )
+    return frame.to_csv(
+        index=False,
+        lineterminator="\n",
+    ).encode("utf-8")
+
+
+class AccountCollectorTest(unittest.TestCase):
+    def test_selected_profile_collection_does_not_mix_same_institution_accounts(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            chequing_root = root / "csv_output" / "tangerine_chequing"
+            savings_root = root / "csv_output" / "tangerine_savings"
+            chequing = replace(
+                make_profile(
+                    root,
+                    chequing_root,
+                    profile_id="tangerine_chequing_account_v1",
+                    institution="Tangerine Bank",
+                    display_name="Tangerine Chequing Account",
+                ),
+                document_type="bank_account_statement",
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+            savings = replace(
+                make_profile(
+                    root,
+                    savings_root,
+                    profile_id="tangerine_savings_account_v1",
+                    institution="Tangerine Bank",
+                    display_name="Tangerine Savings Account",
+                ),
+                document_type="bank_account_statement",
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+
+            write_normalized(
+                chequing_root,
+                "2026/chequing_normalized_transactions.csv",
+                projected_bytes(
+                    [
+                        {
+                            "transaction_date": "2026-01-02",
+                            "description": "Chequing only",
+                            "withdrawal": "1.00",
+                            "deposit": "",
+                            "balance": "99.00",
+                        }
+                    ]
+                ),
+            )
+            write_normalized(
+                savings_root,
+                "2026/savings_normalized_transactions.csv",
+                projected_bytes(
+                    [
+                        {
+                            "transaction_date": "2026-01-03",
+                            "description": "Savings only",
+                            "withdrawal": "",
+                            "deposit": "2.00",
+                            "balance": "102.00",
+                        }
+                    ]
+                ),
+            )
+
+            chequing_result = collect_profile_account_statement_csvs(
+                chequing
+            )
+            savings_result = collect_profile_account_statement_csvs(
+                savings
+            )
+            chequing_combined = read_combined(
+                chequing_result.combined_csv_path
+            )
+            savings_combined = read_combined(
+                savings_result.combined_csv_path
+            )
+
+            self.assertEqual(
+                account_slug(chequing),
+                "tangerine_chequing",
+            )
+            self.assertEqual(
+                chequing_result.combined_csv_path,
+                (
+                    chequing_root
+                    / "tangerine_chequing_all_transactions.csv"
+                ).resolve(),
+            )
+            self.assertEqual(
+                savings_result.combined_csv_path,
+                (
+                    savings_root
+                    / "tangerine_savings_all_transactions.csv"
+                ).resolve(),
+            )
+        self.assertEqual(
+            list(chequing_combined.columns),
+            PROJECTED_COLUMNS,
+        )
+        self.assertEqual(
+            list(savings_combined.columns),
+            PROJECTED_COLUMNS,
+        )
+        self.assertEqual(
+            list(chequing_combined["description"]),
+            ["Chequing only"],
+        )
+        self.assertEqual(
+            list(savings_combined["description"]),
+            ["Savings only"],
+        )
+
+    def test_identical_duplicate_statement_copies_are_collected_once(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "csv_output" / "tangerine_chequing"
+            profile = replace(
+                make_profile(
+                    root,
+                    output_root,
+                    profile_id="tangerine_chequing_account_v1",
+                ),
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+            content = projected_bytes(
+                [
+                    {
+                        "transaction_date": "2026-04-26",
+                        "description": "Copied statement row",
+                        "withdrawal": "",
+                        "deposit": "1.00",
+                        "balance": "101.00",
+                    }
+                ]
+            )
+            root_copy = write_normalized(
+                output_root,
+                "Tangerine-Chequing_Apr26_normalized_transactions.csv",
+                content,
+            )
+            year_copy = write_normalized(
+                output_root,
+                "2026/Tangerine-Chequing_Apr26_normalized_transactions.csv",
+                content,
+            )
+
+            first = collect_profile_account_statement_csvs(profile)
+            first_combined = first.combined_csv_path.read_bytes()
+            first_manifest = first.manifest_path.read_bytes()
+            second = collect_profile_account_statement_csvs(profile)
+            combined = read_combined(second.combined_csv_path)
+
+            self.assertTrue(root_copy.exists())
+            self.assertTrue(year_copy.exists())
+            self.assertEqual(
+                first_combined,
+                second.combined_csv_path.read_bytes(),
+            )
+            self.assertEqual(
+                first_manifest,
+                second.manifest_path.read_bytes(),
+            )
+
+        self.assertEqual(
+            first.collected_count,
+            1,
+        )
+        self.assertEqual(
+            first.duplicate_statement_copies_skipped,
+            1,
+        )
+        self.assertEqual(
+            first.combined_transaction_count,
+            1,
+        )
+        self.assertEqual(
+            list(combined["description"]),
+            ["Copied statement row"],
+        )
+
+    def test_duplicate_copy_choice_is_deterministic(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "csv_output" / "account"
+            profile = replace(
+                make_profile(
+                    root,
+                    output_root,
+                    profile_id="account_v1",
+                ),
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+            content = projected_bytes(
+                [
+                    {
+                        "transaction_date": "2026-04-26",
+                        "description": "Copied statement row",
+                        "withdrawal": "",
+                        "deposit": "1.00",
+                        "balance": "101.00",
+                    }
+                ]
+            )
+            root_copy = write_normalized(
+                output_root,
+                "statement_normalized_transactions.csv",
+                content,
+            )
+            year_copy = write_normalized(
+                output_root,
+                "2026/statement_normalized_transactions.csv",
+                content,
+            )
+
+            with patch(
+                "src.bill_extractor.institution_collector."
+                "_normalized_statement_paths",
+                return_value=[root_copy, year_copy],
+            ):
+                first = collect_profile_account_statement_csvs(profile)
+            with patch(
+                "src.bill_extractor.institution_collector."
+                "_normalized_statement_paths",
+                return_value=[year_copy, root_copy],
+            ):
+                second = collect_profile_account_statement_csvs(profile)
+
+            first_manifest = read_manifest(first.manifest_path)
+            second_manifest = read_manifest(second.manifest_path)
+
+        self.assertEqual(
+            first_manifest["source_statements"],
+            second_manifest["source_statements"],
+        )
+        self.assertEqual(
+            first_manifest["source_statements"],
+            [
+                {
+                    "source_relative_path": (
+                        "2026/statement_normalized_transactions.csv"
+                    ),
+                }
+            ],
+        )
+
+    def test_conflicting_duplicate_statement_copies_fail_safely(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "csv_output" / "account"
+            profile = replace(
+                make_profile(
+                    root,
+                    output_root,
+                    profile_id="account_v1",
+                ),
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+            write_normalized(
+                output_root,
+                "baseline_normalized_transactions.csv",
+                projected_bytes(
+                    [
+                        {
+                            "transaction_date": "2026-01-01",
+                            "description": "Baseline",
+                            "withdrawal": "",
+                            "deposit": "1.00",
+                            "balance": "1.00",
+                        }
+                    ]
+                ),
+            )
+            first = collect_profile_account_statement_csvs(profile)
+            previous_combined = first.combined_csv_path.read_bytes()
+            previous_manifest = first.manifest_path.read_bytes()
+            conflicting_a = projected_bytes(
+                [
+                    {
+                        "transaction_date": "2026-04-26",
+                        "description": "First copy",
+                        "withdrawal": "",
+                        "deposit": "1.00",
+                        "balance": "2.00",
+                    }
+                ]
+            )
+            conflicting_b = projected_bytes(
+                [
+                    {
+                        "transaction_date": "2026-04-26",
+                        "description": "Second copy",
+                        "withdrawal": "",
+                        "deposit": "2.00",
+                        "balance": "3.00",
+                    }
+                ]
+            )
+            write_normalized(
+                output_root,
+                "statement_normalized_transactions.csv",
+                conflicting_a,
+            )
+            write_normalized(
+                output_root,
+                "2026/statement_normalized_transactions.csv",
+                conflicting_b,
+            )
+
+            with self.assertRaisesRegex(
+                InstitutionCollectionError,
+                "same filename but have different contents",
+            ):
+                collect_profile_account_statement_csvs(profile)
+
+            self.assertEqual(
+                first.combined_csv_path.read_bytes(),
+                previous_combined,
+            )
+            self.assertEqual(
+                first.manifest_path.read_bytes(),
+                previous_manifest,
+            )
+
+    def test_different_statement_filenames_with_identical_rows_are_retained(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "csv_output" / "account"
+            profile = replace(
+                make_profile(
+                    root,
+                    output_root,
+                    profile_id="account_v1",
+                ),
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+            row = {
+                "transaction_date": "2026-01-02",
+                "description": "Identical visible row",
+                "withdrawal": "1.00",
+                "deposit": "",
+                "balance": "99.00",
+            }
+
+            write_normalized(
+                output_root,
+                "first_normalized_transactions.csv",
+                projected_bytes([row]),
+            )
+            write_normalized(
+                output_root,
+                "second_normalized_transactions.csv",
+                projected_bytes([row.copy()]),
+            )
+
+            result = collect_profile_account_statement_csvs(profile)
+            combined = read_combined(result.combined_csv_path)
+
+        self.assertEqual(
+            result.collected_count,
+            2,
+        )
+        self.assertEqual(
+            result.duplicate_statement_copies_skipped,
+            0,
+        )
+        self.assertEqual(
+            len(combined),
+            2,
+        )
+
+    def test_eq_bank_account_output_name_and_folder(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "csv_output" / "eq_bank"
+            profile = replace(
+                make_profile(
+                    root,
+                    output_root,
+                    profile_id="eq_bank_account_v1",
+                    institution="EQ Bank",
+                    display_name="EQ Bank Account",
+                ),
+                document_type="bank_account_statement",
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+
+            write_normalized(
+                output_root,
+                "statement_normalized_transactions.csv",
+                projected_bytes(
+                    [
+                        {
+                            "transaction_date": "2026-01-05",
+                            "description": "Synthetic EQ deposit",
+                            "withdrawal": "",
+                            "deposit": "10.00",
+                            "balance": "110.00",
+                        }
+                    ]
+                ),
+            )
+
+            result = collect_profile_account_statement_csvs(
+                profile
+            )
+
+            self.assertEqual(
+                result.combined_csv_path,
+                (output_root / "eq_bank_all_transactions.csv").resolve(),
+            )
+            self.assertEqual(
+                result.output_folder,
+                output_root.resolve(),
+            )
+        self.assertEqual(
+            result.collected_count,
+            1,
+        )
+
+    def test_account_collection_ignores_aggregates_raw_and_user_csvs(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "csv_output" / "account"
+            profile = replace(
+                make_profile(
+                    root,
+                    output_root,
+                    profile_id="account_v1",
+                ),
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+
+            write_normalized(
+                output_root,
+                "2026/statement_normalized_transactions.csv",
+                projected_bytes(
+                    [
+                        {
+                            "transaction_date": "2026-01-01",
+                            "description": "Statement row",
+                            "withdrawal": "",
+                            "deposit": "1.00",
+                            "balance": "1.00",
+                        }
+                    ]
+                ),
+            )
+            write_file(
+                output_root / "account_all_transactions.csv",
+                b"unmanaged combined\n",
+            )
+
+            with self.assertRaisesRegex(
+                InstitutionCollectionError,
+                "unmanaged collection file",
+            ):
+                collect_profile_account_statement_csvs(profile)
+
+            (output_root / "account_all_transactions.csv").unlink()
+            write_file(
+                output_root / "2026" / "account_2026_transactions.csv",
+                b"transaction_date,description\n2026-01-02,Yearly\n",
+            )
+            write_file(
+                output_root / "workflow_summary_20260101.csv",
+                b"summary\n",
+            )
+            write_file(
+                output_root / "2026" / "statement_transactions.csv",
+                b"raw\n",
+            )
+            write_file(
+                output_root / "notes.csv",
+                b"user\n",
+            )
+
+            result = collect_profile_account_statement_csvs(profile)
+            combined = read_combined(result.combined_csv_path)
+
+        self.assertEqual(
+            result.collected_count,
+            1,
+        )
+        self.assertEqual(
+            list(combined["description"]),
+            ["Statement row"],
+        )
+
+    def test_account_collection_preserves_default_canonical_schema(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "csv_output" / "canonical"
+            profile = make_profile(
+                root,
+                output_root,
+                profile_id="canonical_v1",
+            )
+
+            write_normalized(
+                output_root,
+                "statement_normalized_transactions.csv",
+                normalized_bytes(
+                    [
+                        make_row(
+                            "2026-01-01",
+                            "Canonical row",
+                            amount="3.00",
+                        )
+                    ]
+                ),
+            )
+
+            result = collect_profile_account_statement_csvs(profile)
+            combined = read_combined(result.combined_csv_path)
+
+        self.assertEqual(
+            list(combined.columns),
+            list(NORMALIZED_COLUMNS),
+        )
+
+    def test_account_collection_sorting_idempotence_and_no_dedup(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "csv_output" / "account"
+            profile = replace(
+                make_profile(
+                    root,
+                    output_root,
+                    profile_id="account_v1",
+                ),
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+            duplicate = {
+                "transaction_date": "2026-01-02",
+                "description": "Duplicate visible row",
+                "withdrawal": "1.00",
+                "deposit": "",
+                "balance": "99.00",
+            }
+
+            write_normalized(
+                output_root,
+                "2026/b_statement_normalized_transactions.csv",
+                projected_bytes(
+                    [
+                        duplicate,
+                        {
+                            "transaction_date": "2026-01-01",
+                            "description": "Earlier",
+                            "withdrawal": "",
+                            "deposit": "2.00",
+                            "balance": "102.00",
+                        },
+                    ]
+                ),
+            )
+            write_normalized(
+                output_root,
+                "2026/a_statement_normalized_transactions.csv",
+                projected_bytes(
+                    [
+                        duplicate.copy(),
+                        {
+                            "transaction_date": "2026-01-02",
+                            "description": "Same date later row",
+                            "withdrawal": "2.00",
+                            "deposit": "",
+                            "balance": "97.00",
+                        },
+                    ]
+                ),
+            )
+
+            first = collect_profile_account_statement_csvs(profile)
+            first_combined = first.combined_csv_path.read_bytes()
+            first_manifest = first.manifest_path.read_bytes()
+            second = collect_profile_account_statement_csvs(profile)
+            second_combined = second.combined_csv_path.read_bytes()
+            second_manifest = second.manifest_path.read_bytes()
+            combined = read_combined(second.combined_csv_path)
+
+        self.assertEqual(
+            first_combined,
+            second_combined,
+        )
+        self.assertEqual(
+            first_manifest,
+            second_manifest,
+        )
+        self.assertEqual(
+            list(combined["description"]),
+            [
+                "Earlier",
+                "Duplicate visible row",
+                "Same date later row",
+                "Duplicate visible row",
+            ],
+        )
+        self.assertEqual(
+            len(combined),
+            4,
+        )
+
+    def test_empty_account_collection_writes_header_only_csv(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = replace(
+                make_profile(
+                    root,
+                    root / "csv_output" / "empty",
+                    profile_id="empty_v1",
+                ),
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+
+            result = collect_profile_account_statement_csvs(profile)
+            combined = read_combined(result.combined_csv_path)
+
+        self.assertEqual(
+            result.collected_count,
+            0,
+        )
+        self.assertEqual(
+            result.combined_transaction_count,
+            0,
+        )
+        self.assertEqual(
+            list(combined.columns),
+            PROJECTED_COLUMNS,
+        )
+        self.assertTrue(combined.empty)
+
+    def test_existing_combined_survives_failed_account_refresh(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "csv_output" / "account"
+            profile = replace(
+                make_profile(
+                    root,
+                    output_root,
+                    profile_id="account_v1",
+                ),
+                normalized_output_columns=tuple(PROJECTED_COLUMNS),
+            )
+
+            write_normalized(
+                output_root,
+                "good_normalized_transactions.csv",
+                projected_bytes(
+                    [
+                        {
+                            "transaction_date": "2026-01-01",
+                            "description": "Good",
+                            "withdrawal": "",
+                            "deposit": "1.00",
+                            "balance": "1.00",
+                        }
+                    ]
+                ),
+            )
+            first = collect_profile_account_statement_csvs(profile)
+            previous_combined = first.combined_csv_path.read_bytes()
+            previous_manifest = first.manifest_path.read_bytes()
+            user_csv = write_file(
+                output_root / "notes.csv",
+                b"user\n",
+            )
+            previous_user_csv = user_csv.read_bytes()
+
+            write_normalized(
+                output_root,
+                "bad_normalized_transactions.csv",
+                b"bad,data\n1,2\n",
+            )
+
+            with self.assertRaisesRegex(
+                InstitutionCollectionError,
+                "unexpected schema",
+            ):
+                collect_profile_account_statement_csvs(profile)
+
+            self.assertEqual(
+                first.combined_csv_path.read_bytes(),
+                previous_combined,
+            )
+            self.assertEqual(
+                first.manifest_path.read_bytes(),
+                previous_manifest,
+            )
+            self.assertEqual(
+                user_csv.read_bytes(),
+                previous_user_csv,
+            )
 
 
 class InstitutionCollectorTest(unittest.TestCase):

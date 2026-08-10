@@ -12,9 +12,9 @@ from src.bill_extractor.pdf_processor import (
     PDFProcessingError,
 )
 from src.bill_extractor.institution_collector import (
+    AccountCollectionResult,
     InstitutionCollectionError,
-    InstitutionCollectionResult,
-    collect_profile_institution_statement_csvs,
+    collect_profile_account_statement_csvs,
 )
 from src.bill_extractor.profile_loader import (
     ExtractionProfile,
@@ -192,18 +192,18 @@ def workflow_result_messages(
     return messages
 
 
-def institution_collection_result_messages(
-    result: InstitutionCollectionResult,
+def account_collection_result_messages(
+    result: AccountCollectionResult,
 ) -> list[str]:
-    """Build privacy-safe GUI messages for institution collection."""
+    """Build privacy-safe GUI messages for account collection."""
     return [
         "",
-        "INSTITUTION COLLECTION RESULTS",
-        f"Institution: {result.institution}",
-        f"Collection folder: {result.all_statements_folder}",
+        "ACCOUNT COLLECTION RESULTS",
+        f"Profile/account: {result.profile_display_name}",
+        f"Output folder: {result.output_folder}",
         (
-            "Source: configured output folders for all profiles "
-            "at this institution."
+            "Source: normalized statement CSVs in this selected "
+            "profile's configured output folder."
         ),
         (
             "Normalized statement CSVs collected: "
@@ -213,11 +213,11 @@ def institution_collection_result_messages(
             "Combined transactions: "
             f"{result.combined_transaction_count}"
         ),
-        f"Combined CSV: {result.combined_csv_path}",
         (
-            "Stale managed files removed: "
-            f"{result.stale_removed_count}"
+            "Duplicate statement copies skipped: "
+            f"{result.duplicate_statement_copies_skipped}"
         ),
+        f"Combined CSV: {result.combined_csv_path}",
     ]
 
 
@@ -816,7 +816,7 @@ class PDFBillExtractorApp:
 
         self.collect_btn = ttk.Button(
             button_frame,
-            text="Collect Institution CSVs",
+            text="Collect Account CSVs",
             command=self.start_collection,
         )
         self.collect_btn.grid(
@@ -1124,8 +1124,8 @@ class PDFBillExtractorApp:
             f"Folder mode scans {profile.file_pattern} files "
             f"{recursive_text}. Raw and normalized statement CSVs, "
             "yearly consolidated CSVs, and a workflow summary are created. "
-            "Collect Institution CSVs uses the configured profile output "
-            "folders for this institution, not the selected extraction "
+            "Collect Account CSVs uses this selected profile's configured "
+            "output folder, not the selected extraction "
             "output folder."
         )
         self.status_var.set(f"Ready: {profile.display_name}")
@@ -1336,20 +1336,20 @@ class PDFBillExtractorApp:
 
         self._set_buttons_state(tk.DISABLED)
         self.progress.start(10)
-        self.status_var.set("Collecting institution CSVs...")
+        self.status_var.set("Collecting account CSVs...")
         self._append_operation_header(
-            "INSTITUTION COLLECTION",
+            "ACCOUNT COLLECTION",
             (
-                f"Institution: {profile.institution}",
+                f"Profile/account: {profile.display_name}",
             ),
         )
         self._append_result(
             "Collecting normalized statement CSVs for "
-            f"{profile.institution}.\n"
+            f"{profile.display_name}.\n"
         )
         self._append_result(
-            "Source: configured output folders for all profiles at this "
-            "institution, not the selected extraction output folder.\n"
+            "Source: this selected profile's configured output folder, "
+            "not the selected extraction output folder.\n"
         )
 
         worker = threading.Thread(
@@ -1364,10 +1364,7 @@ class PDFBillExtractorApp:
         profile: ExtractionProfile,
     ) -> None:
         try:
-            result = collect_profile_institution_statement_csvs(
-                profile,
-                profiles=self.profiles,
-            )
+            result = collect_profile_account_statement_csvs(profile)
 
             self.root.after(
                 0,
@@ -1381,7 +1378,7 @@ class PDFBillExtractorApp:
             OSError,
         ) as exc:
             logger.exception(
-                "Institution collection failed"
+                "Account collection failed"
             )
             self.root.after(
                 0,
@@ -1391,7 +1388,7 @@ class PDFBillExtractorApp:
 
         except Exception as exc:
             logger.exception(
-                "Unexpected institution collection error"
+                "Unexpected account collection error"
             )
             self.root.after(
                 0,
@@ -1524,9 +1521,9 @@ class PDFBillExtractorApp:
 
     def _collection_succeeded(
         self,
-        result: InstitutionCollectionResult,
+        result: AccountCollectionResult,
     ) -> None:
-        for message in institution_collection_result_messages(
+        for message in account_collection_result_messages(
             result
         ):
             self._append_result(
@@ -1542,21 +1539,20 @@ class PDFBillExtractorApp:
         )
 
         completion_message = (
-            f"Institution: {result.institution}\n"
+            f"Profile/account: {result.profile_display_name}\n"
             "Normalized statement CSVs collected: "
             f"{result.collected_count}\n"
             "Combined transactions: "
             f"{result.combined_transaction_count}\n"
+            "Duplicate statement copies skipped: "
+            f"{result.duplicate_statement_copies_skipped}\n"
             f"Combined CSV: {result.combined_csv_path}\n"
-            "Stale managed files removed: "
-            f"{result.stale_removed_count}\n"
-            "Source: configured output folders for all profiles "
-            "at this institution\n"
-            f"Collection folder: {result.all_statements_folder}"
+            "Source: this selected profile's configured output folder\n"
+            f"Output folder: {result.output_folder}"
         )
 
         messagebox.showinfo(
-            "Institution Collection Complete",
+            "Account Collection Complete",
             completion_message,
         )
 
