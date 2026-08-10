@@ -187,6 +187,10 @@ def is_descendant(
     return False
 
 
+def widget_state(widget: tk.Widget) -> str:
+    return str(widget.cget("state"))
+
+
 class GUIWorkflowTest(unittest.TestCase):
     def test_initial_window_geometry_is_capped_for_small_screens(
         self,
@@ -319,23 +323,23 @@ class GUIWorkflowTest(unittest.TestCase):
         app.input_mode_var.set("file")
         app._update_input_mode_controls()
 
-        self.assertEqual(app.pdf_file_entry.cget("state"), tk.NORMAL)
-        self.assertEqual(app.pdf_file_browse_btn.cget("state"), tk.NORMAL)
-        self.assertEqual(app.pdf_folder_entry.cget("state"), tk.DISABLED)
-        self.assertEqual(app.pdf_folder_browse_btn.cget("state"), tk.DISABLED)
-        self.assertEqual(app.output_folder_entry.cget("state"), tk.NORMAL)
-        self.assertEqual(app.output_folder_browse_btn.cget("state"), tk.NORMAL)
+        self.assertEqual(widget_state(app.pdf_file_entry), "normal")
+        self.assertEqual(widget_state(app.pdf_file_browse_btn), "normal")
+        self.assertEqual(widget_state(app.pdf_folder_entry), "disabled")
+        self.assertEqual(widget_state(app.pdf_folder_browse_btn), "disabled")
+        self.assertEqual(widget_state(app.output_folder_entry), "normal")
+        self.assertEqual(widget_state(app.output_folder_browse_btn), "normal")
 
         app.input_mode_var.set("folder")
         app._update_input_mode_controls()
 
-        self.assertEqual(app.pdf_file_entry.cget("state"), tk.DISABLED)
-        self.assertEqual(app.pdf_file_browse_btn.cget("state"), tk.DISABLED)
-        self.assertEqual(app.pdf_folder_entry.cget("state"), tk.NORMAL)
-        self.assertEqual(app.pdf_folder_browse_btn.cget("state"), tk.NORMAL)
+        self.assertEqual(widget_state(app.pdf_file_entry), "disabled")
+        self.assertEqual(widget_state(app.pdf_file_browse_btn), "disabled")
+        self.assertEqual(widget_state(app.pdf_folder_entry), "normal")
+        self.assertEqual(widget_state(app.pdf_folder_browse_btn), "normal")
         self.assertEqual(app.pdf_file_var.get(), "C:/synthetic/file.pdf")
         self.assertEqual(app.pdf_folder_var.get(), "C:/synthetic/folder")
-        self.assertEqual(app.output_folder_entry.cget("state"), tk.NORMAL)
+        self.assertEqual(widget_state(app.output_folder_entry), "normal")
 
     def test_results_append_as_session_log_with_separators(
         self,
