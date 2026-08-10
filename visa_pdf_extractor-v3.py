@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -35,7 +36,7 @@ from src.bill_extractor.preparation_settings import (
     remember_preparation_account_key,
 )
 from src.bill_extractor.redaction_term_settings import (
-    load_redaction_account_settings,
+    load_redaction_account_settings_for_institution,
     save_redaction_account_settings,
 )
 from src.bill_extractor.workflow import (
@@ -301,6 +302,75 @@ def preparation_account_suggestions(
     )
 
 
+def profile_preparation_account_key(
+    profile: ExtractionProfile,
+) -> str | None:
+    try:
+        return account_key_for_profile(profile).as_posix()
+    except PDFPreparationError:
+        pass
+
+    parts = profile.input_folder.parts
+    lowered = [part.casefold() for part in parts]
+    if "editable_input" not in lowered:
+        return None
+
+    index = lowered.index("editable_input")
+    account_parts = parts[index + 1 :]
+    if not account_parts:
+        return None
+
+    try:
+        return preparation_folders_for_account(
+            Path(*account_parts)
+        ).account_key.as_posix()
+    except PDFPreparationError:
+        return None
+
+
+def preparation_account_institution_map(
+    profiles: tuple[ExtractionProfile, ...],
+) -> dict[str, str]:
+    candidates: dict[str, set[str]] = {}
+
+    for profile in profiles:
+        account_key = profile_preparation_account_key(profile)
+        if account_key is None:
+            continue
+
+        candidates.setdefault(account_key, set()).add(profile.institution)
+
+    return {
+        account_key: next(iter(institutions))
+        for account_key, institutions in candidates.items()
+        if len(institutions) == 1
+    }
+
+
+def institution_preparation_accounts(
+    profiles: tuple[ExtractionProfile, ...],
+) -> dict[str, tuple[str, ...]]:
+    account_to_institution = preparation_account_institution_map(profiles)
+    accounts: dict[str, list[str]] = {}
+
+    for account_key, institution in account_to_institution.items():
+        accounts.setdefault(institution, []).append(account_key)
+
+    return {
+        institution: tuple(
+            sorted(
+                account_keys,
+                key=str.casefold,
+            )
+        )
+        for institution, account_keys in accounts.items()
+    }
+
+
+def local_display_time() -> str:
+    return datetime.now().strftime("%I:%M %p").lstrip("0")
+
+
 class PDFBillExtractorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -332,11 +402,19 @@ class PDFBillExtractorApp:
         self.profiles_by_name = {
             profile.display_name: profile for profile in profiles
         }
+        self.preparation_account_institutions = (
+            preparation_account_institution_map(profiles)
+        )
+        self.institution_preparation_accounts = (
+            institution_preparation_accounts(profiles)
+        )
         self.active_profile = profiles[0]
-        self.preparation_account_was_edited = False
 
         self.setup_ui()
-        self._apply_profile(self.active_profile)
+        self._apply_profile(
+            self.active_profile,
+            clear_results=False,
+        )
 
     def setup_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -568,63 +646,158 @@ class PDFBillExtractorApp:
             wraplength=760,
         ).grid(row=8, column=1, sticky=tk.W, padx=5, pady=(8, 2))
 
-        ttk.Label(main_frame, text="Input Mode:").grid(
-            row=4, column=0, sticky=tk.W, pady=5
+        extraction_io_frame = ttk.Frame(main_frame)
+        extraction_io_frame.grid(
+            row=4,
+            column=0,
+            columnspan=3,
+            sticky=(tk.W, tk.E),
+            pady=(6, 4),
         )
+        extraction_io_frame.columnconfigure(0, weight=1)
+
+        self.input_frame = ttk.LabelFrame(
+            extraction_io_frame,
+            text="Input",
+            padding="5",
+        )
+        self.input_frame.grid(
+            row=0,
+            column=0,
+            sticky=(tk.W, tk.E),
+            pady=(0, 6),
+        )
+        self.input_frame.columnconfigure(1, weight=1)
+
         self.input_mode_var = tk.StringVar(value="file")
-        input_mode_frame = ttk.Frame(main_frame)
-        input_mode_frame.grid(row=4, column=1, columnspan=2, sticky=tk.W)
-        ttk.Radiobutton(
-            input_mode_frame,
+        self.single_pdf_radio = ttk.Radiobutton(
+            self.input_frame,
             text="Single PDF",
             variable=self.input_mode_var,
             value="file",
-        ).grid(row=0, column=0, padx=(0, 15))
-        ttk.Radiobutton(
-            input_mode_frame,
-            text="PDF folder",
-            variable=self.input_mode_var,
-            value="folder",
-        ).grid(row=0, column=1)
-
-        ttk.Label(main_frame, text="PDF File:").grid(
-            row=5, column=0, sticky=tk.W, pady=5
+            command=self._update_input_mode_controls,
+        )
+        self.single_pdf_radio.grid(
+            row=0,
+            column=0,
+            sticky=tk.W,
+            padx=(0, 10),
+            pady=3,
         )
         self.pdf_file_var = tk.StringVar()
-        ttk.Entry(main_frame, textvariable=self.pdf_file_var, width=60).grid(
-            row=5, column=1, sticky=(tk.W, tk.E), padx=5
+        self.pdf_file_entry = ttk.Entry(
+            self.input_frame,
+            textvariable=self.pdf_file_var,
+            width=60,
         )
-        ttk.Button(main_frame, text="Browse", command=self.browse_pdf_file).grid(
-            row=5, column=2, padx=5
+        self.pdf_file_entry.grid(
+            row=0,
+            column=1,
+            sticky=(tk.W, tk.E),
+            padx=5,
+            pady=3,
+        )
+        self.pdf_file_browse_btn = ttk.Button(
+            self.input_frame,
+            text="Browse",
+            command=self.browse_pdf_file,
+        )
+        self.pdf_file_browse_btn.grid(
+            row=0,
+            column=2,
+            padx=5,
+            pady=3,
         )
 
-        ttk.Label(main_frame, text="PDF Folder:").grid(
-            row=6, column=0, sticky=tk.W, pady=5
+        self.pdf_folder_radio = ttk.Radiobutton(
+            self.input_frame,
+            text="PDF Folder",
+            variable=self.input_mode_var,
+            value="folder",
+            command=self._update_input_mode_controls,
+        )
+        self.pdf_folder_radio.grid(
+            row=1,
+            column=0,
+            sticky=tk.W,
+            padx=(0, 10),
+            pady=3,
         )
         self.pdf_folder_var = tk.StringVar()
-        ttk.Entry(main_frame, textvariable=self.pdf_folder_var, width=60).grid(
-            row=6, column=1, sticky=(tk.W, tk.E), padx=5
+        self.pdf_folder_entry = ttk.Entry(
+            self.input_frame,
+            textvariable=self.pdf_folder_var,
+            width=60,
         )
-        ttk.Button(main_frame, text="Browse", command=self.browse_pdf_folder).grid(
-            row=6, column=2, padx=5
+        self.pdf_folder_entry.grid(
+            row=1,
+            column=1,
+            sticky=(tk.W, tk.E),
+            padx=5,
+            pady=3,
+        )
+        self.pdf_folder_browse_btn = ttk.Button(
+            self.input_frame,
+            text="Browse",
+            command=self.browse_pdf_folder,
+        )
+        self.pdf_folder_browse_btn.grid(
+            row=1,
+            column=2,
+            padx=5,
+            pady=3,
         )
 
-        ttk.Label(main_frame, text="Output Folder:").grid(
-            row=7, column=0, sticky=tk.W, pady=5
+        self.output_frame = ttk.LabelFrame(
+            extraction_io_frame,
+            text="Output",
+            padding="5",
         )
+        self.output_frame.grid(
+            row=1,
+            column=0,
+            sticky=(tk.W, tk.E),
+        )
+        self.output_frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            self.output_frame,
+            text="Output CSV Folder",
+        ).grid(row=0, column=0, sticky=tk.W, pady=3)
         self.output_folder_var = tk.StringVar()
-        ttk.Entry(main_frame, textvariable=self.output_folder_var, width=60).grid(
-            row=7, column=1, sticky=(tk.W, tk.E), padx=5
+        self.output_folder_entry = ttk.Entry(
+            self.output_frame,
+            textvariable=self.output_folder_var,
+            width=60,
         )
-        ttk.Button(main_frame, text="Browse", command=self.browse_output_folder).grid(
-            row=7, column=2, padx=5
+        self.output_folder_entry.grid(
+            row=0,
+            column=1,
+            sticky=(tk.W, tk.E),
+            padx=5,
+            pady=3,
         )
+        self.output_folder_browse_btn = ttk.Button(
+            self.output_frame,
+            text="Browse",
+            command=self.browse_output_folder,
+        )
+        self.output_folder_browse_btn.grid(
+            row=0,
+            column=2,
+            padx=5,
+            pady=3,
+        )
+        self.input_mode_var.trace_add(
+            "write",
+            lambda *_args: self._update_input_mode_controls(),
+        )
+        self._update_input_mode_controls()
 
         button_frame = ttk.Frame(
             main_frame
         )
         button_frame.grid(
-            row=8,
+            row=5,
             column=0,
             columnspan=3,
             pady=10,
@@ -656,11 +829,11 @@ class PDFBillExtractorApp:
             main_frame,
             textvariable=self.folder_mode_info_var,
             wraplength=820,
-        ).grid(row=9, column=0, columnspan=3, pady=(0, 5))
+        ).grid(row=6, column=0, columnspan=3, pady=(0, 5))
 
         self.progress = ttk.Progressbar(main_frame, mode="indeterminate")
         self.progress.grid(
-            row=10, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5
+            row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5
         )
 
         self.results_frame = ttk.LabelFrame(
@@ -670,12 +843,31 @@ class PDFBillExtractorApp:
             height=RESULTS_PANE_MIN_HEIGHT,
         )
         self.results_frame.columnconfigure(0, weight=1)
-        self.results_frame.rowconfigure(0, weight=1)
+        self.results_frame.rowconfigure(1, weight=1)
+
+        self.results_header_frame = ttk.Frame(self.results_frame)
+        self.results_header_frame.grid(
+            row=0,
+            column=0,
+            sticky=(tk.W, tk.E),
+            pady=(0, 4),
+        )
+        self.results_header_frame.columnconfigure(0, weight=1)
+        self.clear_results_btn = ttk.Button(
+            self.results_header_frame,
+            text="Clear Results",
+            command=self.clear_results,
+        )
+        self.clear_results_btn.grid(
+            row=0,
+            column=1,
+            sticky=tk.E,
+        )
 
         self.results_text = scrolledtext.ScrolledText(
             self.results_frame, width=90, height=RESULTS_TEXT_MIN_LINES
         )
-        self.results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.results_text.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
         self.main_paned.add(
             self.controls_scroll_container,
@@ -734,14 +926,83 @@ class PDFBillExtractorApp:
         except tk.TclError:
             return
 
+    def _update_input_mode_controls(self) -> None:
+        file_selected = self.input_mode_var.get() == "file"
+        file_state = tk.NORMAL if file_selected else tk.DISABLED
+        folder_state = tk.NORMAL if not file_selected else tk.DISABLED
+
+        self.pdf_file_entry.configure(state=file_state)
+        self.pdf_file_browse_btn.configure(state=file_state)
+        self.pdf_folder_entry.configure(state=folder_state)
+        self.pdf_folder_browse_btn.configure(state=folder_state)
+        self.output_folder_entry.configure(state=tk.NORMAL)
+        self.output_folder_browse_btn.configure(state=tk.NORMAL)
+
+    def clear_results(self) -> None:
+        self.results_text.delete("1.0", tk.END)
+
+    def _results_have_content(self) -> bool:
+        return bool(
+            self.results_text.get(
+                "1.0",
+                "end-1c",
+            ).strip()
+        )
+
+    def _append_operation_header(
+        self,
+        title: str,
+        details: tuple[str, ...] = (),
+    ) -> None:
+        if self._results_have_content():
+            self._append_result("\n" + ("-" * 60) + "\n\n")
+
+        self._append_result(
+            f"=== {title} - {local_display_time()} ===\n"
+        )
+
+        for detail in details:
+            self._append_result(f"{detail}\n")
+
+        if details:
+            self._append_result("\n")
+
+    def _institution_context_for_account(
+        self,
+        account_key: str,
+    ) -> tuple[str | None, tuple[str, ...]]:
+        try:
+            normalized_key = preparation_folders_for_account(
+                account_key
+            ).account_key.as_posix()
+        except PDFPreparationError:
+            return None, ()
+
+        institution = self.preparation_account_institutions.get(
+            normalized_key
+        )
+        if institution is None:
+            return None, ()
+
+        return (
+            institution,
+            self.institution_preparation_accounts.get(
+                institution,
+                (),
+            ),
+        )
+
     def _profile_selected(self, _event: object | None = None) -> None:
-        self._apply_profile(self.profiles_by_name[self.profile_var.get()])
+        self._apply_profile(
+            self.profiles_by_name[self.profile_var.get()],
+            clear_results=True,
+        )
 
     def _preparation_account_changed(
         self,
         _event: object | None = None,
     ) -> None:
-        self.preparation_account_was_edited = True
+        self.clear_results()
         self._update_preparation_paths()
         self._load_redaction_terms_for_preparation_account()
 
@@ -749,7 +1010,7 @@ class PDFBillExtractorApp:
         self,
         _event: object | None = None,
     ) -> None:
-        self.preparation_account_was_edited = True
+        self.clear_results()
         self._update_preparation_paths()
 
     def _set_redaction_terms(
@@ -778,8 +1039,13 @@ class PDFBillExtractorApp:
             return
 
         try:
-            settings = load_redaction_account_settings(
-                account_key
+            institution, institution_account_keys = (
+                self._institution_context_for_account(account_key)
+            )
+            settings = load_redaction_account_settings_for_institution(
+                account_key,
+                institution=institution,
+                institution_account_keys=institution_account_keys,
             )
         except Exception:
             self._set_redaction_terms(())
@@ -815,7 +1081,15 @@ class PDFBillExtractorApp:
         self.prep_editable_var.set(str(folders.editable_folder))
         self.prep_redacted_var.set(str(folders.redacted_folder))
 
-    def _apply_profile(self, profile: ExtractionProfile) -> None:
+    def _apply_profile(
+        self,
+        profile: ExtractionProfile,
+        *,
+        clear_results: bool,
+    ) -> None:
+        if clear_results:
+            self.clear_results()
+
         self.active_profile = profile
 
         input_folder = profile.resolve_input_folder()
@@ -827,17 +1101,10 @@ class PDFBillExtractorApp:
         self.pdf_folder_var.set(str(input_folder))
         self.output_folder_var.set(str(output_folder))
 
-        if not self.preparation_account_was_edited:
-            try:
-                account_key = account_key_for_profile(
-                    profile
-                )
-            except PDFPreparationError:
-                self.preparation_account_var.set("")
-            else:
-                self.preparation_account_var.set(
-                    account_key.as_posix()
-                )
+        account_key = profile_preparation_account_key(profile)
+        self.preparation_account_var.set(
+            account_key if account_key is not None else ""
+        )
 
         self._update_preparation_paths()
         self._load_redaction_terms_for_preparation_account()
@@ -872,6 +1139,7 @@ class PDFBillExtractorApp:
         if file_path:
             self.input_mode_var.set("file")
             self.pdf_file_var.set(file_path)
+            self._update_input_mode_controls()
 
     def browse_pdf_folder(self) -> None:
         folder = filedialog.askdirectory(
@@ -881,6 +1149,7 @@ class PDFBillExtractorApp:
         if folder:
             self.input_mode_var.set("folder")
             self.pdf_folder_var.set(folder)
+            self._update_input_mode_controls()
 
     def browse_output_folder(self) -> None:
         folder = filedialog.askdirectory(
@@ -955,12 +1224,19 @@ class PDFBillExtractorApp:
             remember_preparation_account_key(
                 folders.account_key.as_posix()
             )
+            institution, institution_account_keys = (
+                self._institution_context_for_account(
+                    folders.account_key.as_posix()
+                )
+            )
             save_redaction_account_settings(
                 folders.account_key.as_posix(),
                 terms,
                 etransfer_keep_first_name_only=(
                     structured_options.etransfer_keep_first_name_only
                 ),
+                institution=institution,
+                institution_account_keys=institution_account_keys,
             )
         except Exception as exc:
             messagebox.showerror(
@@ -981,18 +1257,14 @@ class PDFBillExtractorApp:
         self._set_buttons_state(tk.DISABLED)
         self.progress.start(10)
         self.status_var.set("Preparing PDFs...")
-        self.results_text.delete("1.0", tk.END)
-        self._append_result(
-            f"Preparation account: {folders.account_key.as_posix()}\n"
-        )
-        self._append_result(
-            f"Source folder: {folders.source_folder}\n"
-        )
-        self._append_result(
-            f"Editable folder: {folders.editable_folder}\n"
-        )
-        self._append_result(
-            f"Redacted folder: {folders.redacted_folder}\n"
+        self._append_operation_header(
+            "PDF PREPARATION",
+            (
+                f"Account: {folders.account_key.as_posix()}",
+                f"Source folder: {folders.source_folder}",
+                f"Editable folder: {folders.editable_folder}",
+                f"Redacted folder: {folders.redacted_folder}",
+            ),
         )
         self._append_result(
             "Preparing PDFs. Extraction will not run automatically.\n"
@@ -1040,8 +1312,12 @@ class PDFBillExtractorApp:
         self._set_buttons_state(tk.DISABLED)
         self.progress.start(10)
         self.status_var.set("Processing...")
-        self.results_text.delete("1.0", tk.END)
-        self._append_result(f"Profile: {profile.display_name} ({profile.profile_id})\n")
+        self._append_operation_header(
+            "TRANSACTION EXTRACTION",
+            (
+                f"Profile: {profile.display_name} ({profile.profile_id})",
+            ),
+        )
         self._append_result(opening_message)
 
         worker = threading.Thread(
@@ -1061,9 +1337,11 @@ class PDFBillExtractorApp:
         self._set_buttons_state(tk.DISABLED)
         self.progress.start(10)
         self.status_var.set("Collecting institution CSVs...")
-        self.results_text.delete("1.0", tk.END)
-        self._append_result(
-            f"Institution: {profile.institution}\n"
+        self._append_operation_header(
+            "INSTITUTION COLLECTION",
+            (
+                f"Institution: {profile.institution}",
+            ),
         )
         self._append_result(
             "Collecting normalized statement CSVs for "

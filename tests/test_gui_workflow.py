@@ -15,6 +15,9 @@ from src.bill_extractor.pdf_redaction import (
 from src.bill_extractor.pdf_preparation import (
     PDFPreparationResult,
 )
+from src.bill_extractor.redaction_term_settings import (
+    RedactionAccountSettings,
+)
 from src.bill_extractor.profile_loader import (
     ExtractionProfile,
 )
@@ -53,15 +56,48 @@ SPEC.loader.exec_module(GUI_MODULE)
 
 def make_profile(
     root: Path,
+    *,
+    account_key: str = "test_account",
+    display_name: str = "Test Profile",
+    institution: str = "Test Bank",
+    profile_id: str = "test_v1",
 ) -> ExtractionProfile:
     return ExtractionProfile(
-        profile_id="test_v1",
-        display_name="Test Profile",
+        profile_id=profile_id,
+        display_name=display_name,
         profile_version=1,
-        institution="Test Bank",
+        institution=institution,
         document_type="bank_account_statement",
         parser="rbc_chequing_account",
-        input_folder=root / "editable",
+        input_folder=root / "editable_input" / account_key,
+        output_folder=root / "csv",
+        file_pattern="*.pdf",
+        recursive=True,
+        preserve_subfolders=True,
+        required_headers=("Date",),
+        excluded_page_phrases=(),
+        line_tolerance=2.5,
+        continuation_gap=18.0,
+        source_path=Path("config/profiles/test.json"),
+    )
+
+
+def make_account_profile(
+    root: Path,
+    *,
+    account_key: str,
+    display_name: str,
+    institution: str,
+    profile_id: str,
+) -> ExtractionProfile:
+    return ExtractionProfile(
+        profile_id=profile_id,
+        display_name=display_name,
+        profile_version=1,
+        institution=institution,
+        document_type="bank_account_statement",
+        parser="rbc_chequing_account",
+        input_folder=root / "editable_input" / account_key,
         output_folder=root / "csv",
         file_pattern="*.pdf",
         recursive=True,
@@ -76,6 +112,9 @@ def make_profile(
 
 def create_test_app(
     test_case: unittest.TestCase,
+    *,
+    profiles: tuple[ExtractionProfile, ...] | None = None,
+    redaction_settings: RedactionAccountSettings | None = None,
 ):
     try:
         root = tk.Tk()
@@ -87,23 +126,40 @@ def create_test_app(
 
     temporary_folder = tempfile.TemporaryDirectory()
     test_case.addCleanup(temporary_folder.cleanup)
-    profile = make_profile(Path(temporary_folder.name))
+    if profiles is None:
+        profile = make_profile(Path(temporary_folder.name))
+        profiles = (profile,)
+    else:
+        profile = profiles[0]
+
+    settings = redaction_settings or RedactionAccountSettings()
 
     patches = [
         patch.object(
             GUI_MODULE,
             "discover_profiles",
-            return_value=(profile,),
+            return_value=profiles,
         ),
         patch.object(
             GUI_MODULE,
             "preparation_account_suggestions",
-            return_value=("test_account",),
+            return_value=tuple(
+                sorted(
+                    filter(
+                        None,
+                        (
+                            GUI_MODULE.profile_preparation_account_key(active)
+                            for active in profiles
+                        ),
+                    ),
+                    key=str.casefold,
+                )
+            ),
         ),
         patch.object(
             GUI_MODULE,
-            "load_redaction_account_settings",
-            side_effect=RuntimeError("synthetic settings unavailable"),
+            "load_redaction_account_settings_for_institution",
+            return_value=settings,
         ),
     ]
 
@@ -217,6 +273,243 @@ class GUIWorkflowTest(unittest.TestCase):
         self.assertIsNot(
             app.results_text.master,
             app.controls_scroll_container,
+        )
+
+    def test_extraction_input_and_output_are_separate_groups(
+        self,
+    ) -> None:
+        _root, app = create_test_app(self)
+
+        self.assertIsNot(app.input_frame, app.output_frame)
+        self.assertIs(app.input_frame.master, app.output_frame.master)
+        self.assertIs(app.single_pdf_radio.master, app.input_frame)
+        self.assertIs(app.pdf_file_entry.master, app.input_frame)
+        self.assertIs(app.pdf_file_browse_btn.master, app.input_frame)
+        self.assertIs(app.pdf_folder_radio.master, app.input_frame)
+        self.assertIs(app.pdf_folder_entry.master, app.input_frame)
+        self.assertIs(app.pdf_folder_browse_btn.master, app.input_frame)
+        self.assertIs(app.output_folder_entry.master, app.output_frame)
+        self.assertIs(app.output_folder_browse_btn.master, app.output_frame)
+
+        self.assertEqual(
+            app.single_pdf_radio.grid_info()["row"],
+            app.pdf_file_entry.grid_info()["row"],
+        )
+        self.assertEqual(
+            app.single_pdf_radio.grid_info()["row"],
+            app.pdf_file_browse_btn.grid_info()["row"],
+        )
+        self.assertEqual(
+            app.pdf_folder_radio.grid_info()["row"],
+            app.pdf_folder_entry.grid_info()["row"],
+        )
+        self.assertEqual(
+            app.pdf_folder_radio.grid_info()["row"],
+            app.pdf_folder_browse_btn.grid_info()["row"],
+        )
+
+    def test_input_mode_enables_only_selected_input_row(
+        self,
+    ) -> None:
+        _root, app = create_test_app(self)
+
+        app.pdf_file_var.set("C:/synthetic/file.pdf")
+        app.pdf_folder_var.set("C:/synthetic/folder")
+
+        app.input_mode_var.set("file")
+        app._update_input_mode_controls()
+
+        self.assertEqual(app.pdf_file_entry.cget("state"), tk.NORMAL)
+        self.assertEqual(app.pdf_file_browse_btn.cget("state"), tk.NORMAL)
+        self.assertEqual(app.pdf_folder_entry.cget("state"), tk.DISABLED)
+        self.assertEqual(app.pdf_folder_browse_btn.cget("state"), tk.DISABLED)
+        self.assertEqual(app.output_folder_entry.cget("state"), tk.NORMAL)
+        self.assertEqual(app.output_folder_browse_btn.cget("state"), tk.NORMAL)
+
+        app.input_mode_var.set("folder")
+        app._update_input_mode_controls()
+
+        self.assertEqual(app.pdf_file_entry.cget("state"), tk.DISABLED)
+        self.assertEqual(app.pdf_file_browse_btn.cget("state"), tk.DISABLED)
+        self.assertEqual(app.pdf_folder_entry.cget("state"), tk.NORMAL)
+        self.assertEqual(app.pdf_folder_browse_btn.cget("state"), tk.NORMAL)
+        self.assertEqual(app.pdf_file_var.get(), "C:/synthetic/file.pdf")
+        self.assertEqual(app.pdf_folder_var.get(), "C:/synthetic/folder")
+        self.assertEqual(app.output_folder_entry.cget("state"), tk.NORMAL)
+
+    def test_results_append_as_session_log_with_separators(
+        self,
+    ) -> None:
+        _root, app = create_test_app(self)
+
+        app._append_operation_header(
+            "PDF PREPARATION",
+            ("Account: test_account",),
+        )
+        app._append_result("Preparation complete\n")
+        app._append_operation_header(
+            "TRANSACTION EXTRACTION",
+            ("Profile: Test Profile",),
+        )
+        app._append_result("Extraction complete\n")
+
+        text = app.results_text.get("1.0", "end-1c")
+
+        self.assertIn("=== PDF PREPARATION - ", text)
+        self.assertIn("Preparation complete", text)
+        self.assertIn("=== TRANSACTION EXTRACTION - ", text)
+        self.assertIn("Extraction complete", text)
+        self.assertIn("-" * 60, text)
+
+    def test_result_clear_conditions_are_context_changes_only(
+        self,
+    ) -> None:
+        temporary_folder = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_folder.cleanup)
+        root_path = Path(temporary_folder.name)
+        profiles = (
+            make_account_profile(
+                root_path,
+                account_key="tangerine_chequing",
+                display_name="Tangerine Chequing Account",
+                institution="Tangerine Bank",
+                profile_id="tangerine_chequing_account_v1",
+            ),
+            make_account_profile(
+                root_path,
+                account_key="tangerine_savings",
+                display_name="Tangerine Savings Account",
+                institution="Tangerine Bank",
+                profile_id="tangerine_savings_account_v1",
+            ),
+        )
+        _root, app = create_test_app(self, profiles=profiles)
+
+        app._append_result("session log\n")
+        app.input_mode_var.set("folder")
+        app.pdf_file_var.set("C:/synthetic/file.pdf")
+        app.pdf_folder_var.set("C:/synthetic/folder")
+        app.output_folder_var.set("C:/synthetic/output")
+        self.assertIn(
+            "session log",
+            app.results_text.get("1.0", "end-1c"),
+        )
+
+        app.preparation_account_var.set("manual_account")
+        app._preparation_account_changed()
+        self.assertEqual(app.results_text.get("1.0", "end-1c"), "")
+
+        app._append_result("new context log\n")
+        app.profile_var.set("Tangerine Savings Account")
+        app._profile_selected()
+        self.assertEqual(app.results_text.get("1.0", "end-1c"), "")
+
+    def test_clear_results_button_clears_immediately(
+        self,
+    ) -> None:
+        _root, app = create_test_app(self)
+
+        app._append_result("synthetic result\n")
+        app.clear_results_btn.invoke()
+
+        self.assertEqual(app.results_text.get("1.0", "end-1c"), "")
+
+    def test_profile_change_synchronizes_preparation_account(
+        self,
+    ) -> None:
+        temporary_folder = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_folder.cleanup)
+        root_path = Path(temporary_folder.name)
+        profiles = (
+            make_account_profile(
+                root_path,
+                account_key="tangerine_chequing",
+                display_name="Tangerine Chequing Account",
+                institution="Tangerine Bank",
+                profile_id="tangerine_chequing_account_v1",
+            ),
+            make_account_profile(
+                root_path,
+                account_key="tangerine_savings",
+                display_name="Tangerine Savings Account",
+                institution="Tangerine Bank",
+                profile_id="tangerine_savings_account_v1",
+            ),
+        )
+        _root, app = create_test_app(self, profiles=profiles)
+
+        self.assertEqual(
+            app.preparation_account_var.get(),
+            "tangerine_chequing",
+        )
+
+        app.preparation_account_var.set("manual_account")
+        app._preparation_account_changed()
+        self.assertEqual(app.preparation_account_var.get(), "manual_account")
+
+        app.profile_var.set("Tangerine Savings Account")
+        app._profile_selected()
+        self.assertEqual(
+            app.preparation_account_var.get(),
+            "tangerine_savings",
+        )
+
+        app.preparation_account_var.set("another_manual_account")
+        app._preparation_account_changed()
+        app.profile_var.set("Tangerine Chequing Account")
+        app._profile_selected()
+        self.assertEqual(
+            app.preparation_account_var.get(),
+            "tangerine_chequing",
+        )
+
+    def test_institution_mapping_groups_tangerine_accounts(
+        self,
+    ) -> None:
+        temporary_folder = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_folder.cleanup)
+        root_path = Path(temporary_folder.name)
+        profiles = (
+            make_account_profile(
+                root_path,
+                account_key="tangerine_chequing",
+                display_name="Tangerine Chequing Account",
+                institution="Tangerine Bank",
+                profile_id="tangerine_chequing_account_v1",
+            ),
+            make_account_profile(
+                root_path,
+                account_key="tangerine_savings",
+                display_name="Tangerine Savings Account",
+                institution="Tangerine Bank",
+                profile_id="tangerine_savings_account_v1",
+            ),
+            make_account_profile(
+                root_path,
+                account_key="other_account",
+                display_name="Other Account",
+                institution="Other Bank",
+                profile_id="other_account_v1",
+            ),
+        )
+
+        self.assertEqual(
+            GUI_MODULE.preparation_account_institution_map(profiles),
+            {
+                "other_account": "Other Bank",
+                "tangerine_chequing": "Tangerine Bank",
+                "tangerine_savings": "Tangerine Bank",
+            },
+        )
+        self.assertEqual(
+            GUI_MODULE.institution_preparation_accounts(profiles),
+            {
+                "Other Bank": ("other_account",),
+                "Tangerine Bank": (
+                    "tangerine_chequing",
+                    "tangerine_savings",
+                ),
+            },
         )
 
     def test_workflow_messages_include_all_outputs(
