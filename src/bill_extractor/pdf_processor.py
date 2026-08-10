@@ -128,6 +128,21 @@ TANGERINE_DATE_RE = re.compile(
     r")\s+\d{4}$",
     re.IGNORECASE,
 )
+EQ_STATEMENT_PERIOD_RE = re.compile(
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s+to\s+"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
+EQ_DATE_RE = re.compile(rf"^{MONTHS}\s+\d{{1,2}}$", re.IGNORECASE)
+EQ_SUMMARY_AMOUNT_RE = re.compile(
+    r"^[+\-=]?\$?\d[\d,]*\.\d{2}(?:\*+)?$"
+)
+EQ_SUMMARY_LABELS = {
+    "opening balance": "opening",
+    "total deposits": "deposits",
+    "total withdrawals": "withdrawals",
+    "closing balance": "closing",
+}
 CAPITAL_ONE_STATEMENT_PERIOD_RE = re.compile(
     r"Statement\s+Period\s*:?\s*"
     r"([A-Za-z]+\s+\d{1,2})"
@@ -215,6 +230,7 @@ SUPPORTED_PARSERS = {
     "simplii_chequing_account",
     "tangerine_chequing_account",
     "tangerine_savings_account",
+    "eq_bank_account",
     "td_visa_credit_card",
     "rbc_visa_credit_card",
     "rbc_chequing_account",
@@ -4050,6 +4066,636 @@ class VisaPDFProcessor:
                 f"${closing_balance:,.2f}."
             )
 
+    # EQ Bank account parser -------------------------------------------------
+
+    @staticmethod
+    def _extract_eq_statement_period(
+        page_text: str,
+    ) -> tuple[date | None, date | None]:
+        normalized = VisaPDFProcessor._normalize_text(page_text)
+        match = EQ_STATEMENT_PERIOD_RE.search(normalized)
+
+        if match is None:
+            return None, None
+
+        parsed_dates: list[date] = []
+        for value in match.groups():
+            parsed_date: date | None = None
+            for date_format in (
+                "%B %d, %Y",
+                "%b %d, %Y",
+            ):
+                try:
+                    parsed_date = datetime.strptime(
+                        value,
+                        date_format,
+                    ).date()
+                    break
+                except ValueError:
+                    continue
+
+            if parsed_date is None:
+                raise PDFProcessingError(
+                    "Invalid EQ Bank statement-period date."
+                )
+
+            parsed_dates.append(parsed_date)
+
+        statement_start, statement_end = parsed_dates
+        if statement_start > statement_end:
+            raise PDFProcessingError(
+                "EQ Bank statement-period start date is later than its end date."
+            )
+
+        return statement_start, statement_end
+
+    def _resolve_eq_transaction_date(
+        self,
+        value: str,
+        statement_start: date | None,
+        statement_end: date | None,
+    ) -> date:
+        if statement_start is None or statement_end is None:
+            raise PDFProcessingError(
+                "EQ Bank statement period was not found. Transaction years "
+                "cannot be resolved safely."
+            )
+
+        normalized = self._normalize_text(value)
+        parsed_month_day: datetime | None = None
+
+        for date_format in ("%b %d %Y", "%B %d %Y"):
+            try:
+                parsed_month_day = datetime.strptime(
+                    f"{normalized} 2000",
+                    date_format,
+                )
+                break
+            except ValueError:
+                continue
+
+        if parsed_month_day is None:
+            raise PDFProcessingError(
+                "Invalid EQ Bank transaction date."
+            )
+
+        candidates = [
+            date(year, parsed_month_day.month, parsed_month_day.day)
+            for year in range(statement_start.year, statement_end.year + 1)
+        ]
+        valid = [
+            candidate
+            for candidate in candidates
+            if statement_start <= candidate <= statement_end
+        ]
+
+        if len(valid) != 1:
+            raise PDFProcessingError(
+                "EQ Bank transaction date could not be resolved uniquely "
+                "within the statement period."
+            )
+
+        return valid[0]
+
+    def _extract_eq_summary(
+        self,
+        page: fitz.Page,
+    ) -> dict[str, Decimal]:
+        words = page.get_text("words")
+        lines = self._group_words_into_lines(words)
+        activity_summary_y: float | None = None
+        label_matches: dict[str, dict[str, float]] = {}
+        summary: dict[str, Decimal] = {}
+
+        for line in lines:
+            tokens = [
+                str(word[4]).strip().casefold()
+                for word in line["words"]
+            ]
+
+            for index in range(0, len(tokens) - 2):
+                if tokens[index:index + 3] == [
+                    "your",
+                    "activity",
+                    "summary",
+                ]:
+                    activity_summary_y = line["y_center"]
+                    break
+
+            if activity_summary_y is not None:
+                break
+
+        for line in lines:
+            if (
+                activity_summary_y is not None
+                and line["y_center"] <= activity_summary_y
+            ):
+                continue
+
+            line_words = line["words"]
+            tokens = [
+                str(word[4]).strip().casefold()
+                for word in line_words
+            ]
+
+            for label, key in EQ_SUMMARY_LABELS.items():
+                label_tokens = label.split()
+                token_count = len(label_tokens)
+
+                for index in range(0, len(tokens) - token_count + 1):
+                    if tokens[index:index + token_count] != label_tokens:
+                        continue
+
+                    matched_words = line_words[index:index + token_count]
+
+                    if key in label_matches:
+                        raise PDFProcessingError(
+                            "EQ Bank statement summary label was found more "
+                            "than once."
+                        )
+
+                    label_matches[key] = {
+                        "x0": min(word[0] for word in matched_words),
+                        "x1": max(word[2] for word in matched_words),
+                        "y0": min(word[1] for word in matched_words),
+                        "y_center": line["y_center"],
+                    }
+
+        if not label_matches:
+            return summary
+
+        expected_keys = set(EQ_SUMMARY_LABELS.values())
+
+        if set(label_matches) != expected_keys:
+            raise PDFProcessingError(
+                "EQ Bank statement summary labels were incomplete."
+            )
+
+        amount_words = [
+            word
+            for word in words
+            if EQ_SUMMARY_AMOUNT_RE.fullmatch(str(word[4]).strip())
+        ]
+
+        for label, key in EQ_SUMMARY_LABELS.items():
+            label_box = label_matches[key]
+            same_row_words = [
+                word
+                for word in words
+                if (
+                    abs(
+                        ((word[1] + word[3]) / 2)
+                        - label_box["y_center"]
+                    ) <= 4.0
+                    and word[0] > label_box["x1"] + 1.0
+                )
+            ]
+            right_side_words = [
+                word
+                for word in same_row_words
+                if (
+                    not EQ_SUMMARY_AMOUNT_RE.fullmatch(
+                        str(word[4]).strip()
+                    )
+                    and str(word[4]).strip() not in ("+", "-", "=")
+                )
+            ]
+            right_boundary = (
+                min(word[0] for word in right_side_words)
+                if right_side_words
+                else page.rect.x1 + 1.0
+            )
+            candidates = [
+                word
+                for word in amount_words
+                if (
+                    (
+                        activity_summary_y is None
+                        or ((word[1] + word[3]) / 2) > activity_summary_y
+                    )
+                    and abs(
+                        ((word[1] + word[3]) / 2)
+                        - label_box["y_center"]
+                    ) <= 4.0
+                    and word[0] > label_box["x1"] + 1.0
+                    and word[0] < right_boundary
+                )
+            ]
+
+            if len(candidates) != 1:
+                raise PDFProcessingError(
+                    "EQ Bank statement summary value could not be associated "
+                    "unambiguously."
+                )
+
+            amount = self._parse_amount(str(candidates[0][4]).lstrip("+-="))
+            summary[key] = abs(amount)
+
+        return summary
+
+    def _find_eq_transaction_header(
+        self,
+        page: fitz.Page,
+    ) -> dict | None:
+        lines = self._group_words_into_lines(page.get_text("words"))
+
+        for line in lines:
+            words = line["words"]
+            tokens = [
+                str(word[4]).strip().casefold()
+                for word in words
+            ]
+
+            if not all(
+                token in tokens
+                for token in (
+                    "date",
+                    "description",
+                    "withdrawals",
+                    "deposits",
+                    "balance",
+                )
+            ):
+                continue
+
+            date_word = next(
+                word for word in words if str(word[4]).casefold() == "date"
+            )
+            description_word = next(
+                word
+                for word in words
+                if str(word[4]).casefold() == "description"
+            )
+            withdrawals_word = next(
+                word
+                for word in words
+                if str(word[4]).casefold() == "withdrawals"
+            )
+            deposits_word = next(
+                word
+                for word in words
+                if str(word[4]).casefold() == "deposits"
+            )
+            balance_word = next(
+                word
+                for word in words
+                if str(word[4]).casefold() == "balance"
+            )
+
+            positions = [
+                date_word[0],
+                description_word[0],
+                withdrawals_word[0],
+                deposits_word[0],
+                balance_word[0],
+            ]
+
+            if positions != sorted(positions):
+                continue
+
+            return {
+                "date": date_word[0],
+                "description": description_word[0],
+                "withdrawals": withdrawals_word[0],
+                "deposits": deposits_word[0],
+                "balance": balance_word[0],
+                "bottom": max(word[3] for word in words),
+            }
+
+        return None
+
+    def _line_to_eq_cells(
+        self,
+        line: dict,
+        header: dict,
+    ) -> dict[str, str]:
+        cells = {
+            "date": [],
+            "description": [],
+            "withdrawals": [],
+            "deposits": [],
+            "balance": [],
+        }
+
+        for word in line["words"]:
+            text = str(word[4])
+            x_center = self._word_center_x(word)
+
+            if x_center < header["date"]:
+                continue
+
+            if x_center < header["description"]:
+                cells["date"].append(text)
+            elif x_center < header["withdrawals"]:
+                cells["description"].append(text)
+            elif x_center < header["deposits"]:
+                cells["withdrawals"].append(text)
+            elif x_center < header["balance"]:
+                cells["deposits"].append(text)
+            else:
+                cells["balance"].append(text)
+
+        return {
+            key: self._normalize_text(" ".join(parts))
+            for key, parts in cells.items()
+        }
+
+    def _eq_cell_words(
+        self,
+        words: Iterable[tuple],
+        header: dict,
+        column: str,
+    ) -> list[tuple]:
+        selected: list[tuple] = []
+
+        for word in words:
+            x_center = self._word_center_x(word)
+
+            if column == "description":
+                in_column = (
+                    header["description"]
+                    <= x_center
+                    < header["withdrawals"]
+                )
+            elif column == "date":
+                in_column = (
+                    header["date"]
+                    <= x_center
+                    < header["description"]
+                )
+            elif column == "withdrawals":
+                in_column = (
+                    header["withdrawals"]
+                    <= x_center
+                    < header["deposits"]
+                )
+            elif column == "deposits":
+                in_column = (
+                    header["deposits"]
+                    <= x_center
+                    < header["balance"]
+                )
+            elif column == "balance":
+                in_column = x_center >= header["balance"]
+            else:
+                raise ValueError(f"Unknown EQ Bank column: {column}")
+
+            if in_column:
+                selected.append(word)
+
+        return selected
+
+    def _find_eq_footer_y(
+        self,
+        lines: list[dict],
+        header: dict,
+    ) -> float | None:
+        footer_markers = (
+            "page ",
+            "copyright",
+            "footer",
+            "eq bank",
+            "member cdic",
+            "www.",
+        )
+
+        for line in lines:
+            if line["y_center"] <= header["bottom"]:
+                continue
+
+            text = self._normalize_text(
+                " ".join(str(word[4]) for word in line["words"])
+            ).casefold()
+
+            if any(marker in text for marker in footer_markers):
+                return line["y_center"]
+
+        return None
+
+    def _extract_eq_page_transactions(
+        self,
+        page: fitz.Page,
+        statement_start: date | None,
+        statement_end: date | None,
+    ) -> list[dict[str, str]]:
+        if self._page_is_excluded(page.get_text("text")):
+            return []
+
+        header = self._find_eq_transaction_header(page)
+        if header is None:
+            return []
+
+        words = [
+            word
+            for word in page.get_text("words")
+            if word[1] >= header["bottom"] - 1
+        ]
+        lines = self._group_words_into_lines(words)
+        anchors: list[dict] = []
+
+        for line in lines:
+            cells = self._line_to_eq_cells(
+                line,
+                header,
+            )
+
+            if not (
+                EQ_DATE_RE.fullmatch(cells["date"])
+                and AMOUNT_RE.fullmatch(cells["balance"])
+            ):
+                continue
+
+            has_withdrawal = bool(
+                AMOUNT_RE.fullmatch(cells["withdrawals"])
+            )
+            has_deposit = bool(
+                AMOUNT_RE.fullmatch(cells["deposits"])
+            )
+
+            if has_withdrawal and has_deposit:
+                raise PDFProcessingError(
+                    "EQ Bank transaction row has both withdrawal and deposit."
+                )
+
+            if not has_withdrawal and not has_deposit:
+                raise PDFProcessingError(
+                    "EQ Bank transaction row has neither withdrawal nor deposit."
+                )
+
+            anchors.append(
+                {
+                    "y": line["y_center"],
+                    "date": self._resolve_eq_transaction_date(
+                        cells["date"],
+                        statement_start,
+                        statement_end,
+                    ),
+                    "withdrawal": (
+                        cells["withdrawals"] if has_withdrawal else ""
+                    ),
+                    "deposit": cells["deposits"] if has_deposit else "",
+                    "balance": cells["balance"],
+                }
+            )
+
+        if not anchors:
+            return []
+
+        description_words = self._eq_cell_words(
+            words,
+            header,
+            "description",
+        )
+        description_lines = self._group_words_into_lines(description_words)
+        footer_y = self._find_eq_footer_y(
+            lines,
+            header,
+        )
+        rows: list[dict[str, str]] = []
+
+        for index, anchor in enumerate(anchors):
+            candidate_lines = [
+                line
+                for line in description_lines
+                if anchor["y"] - 8.0 <= line["y_center"] <= anchor["y"] + 2.0
+            ]
+            description_start = (
+                min(line["y_center"] for line in candidate_lines)
+                if candidate_lines
+                else anchor["y"]
+            )
+            description_end = (
+                anchors[index + 1]["y"]
+                if index + 1 < len(anchors)
+                else page.rect.y1 + 1.0
+            )
+
+            if footer_y is not None and footer_y > description_start:
+                description_end = min(description_end, footer_y)
+
+            band_words = [
+                word
+                for word in description_words
+                if (
+                    (word[1] + word[3]) / 2 >= description_start - 0.5
+                    and (word[1] + word[3]) / 2 < description_end - 0.5
+                )
+            ]
+            description = self._normalize_text(
+                " ".join(
+                    str(word[4])
+                    for line in self._group_words_into_lines(band_words)
+                    for word in line["words"]
+                )
+            )
+
+            if not description:
+                raise PDFProcessingError(
+                    "EQ Bank transaction amount found without a description."
+                )
+
+            rows.append(
+                {
+                    "Date": anchor["date"].isoformat(),
+                    "Description": description,
+                    "Withdrawals": anchor["withdrawal"].replace("$", ""),
+                    "Deposits": anchor["deposit"].replace("$", ""),
+                    "Balance": anchor["balance"].replace("$", ""),
+                }
+            )
+
+        return rows
+
+    def _validate_eq_reconciliation(
+        self,
+        transactions: pd.DataFrame,
+        opening_balance: Decimal | None,
+        total_deposits: Decimal | None,
+        total_withdrawals: Decimal | None,
+        closing_balance: Decimal | None,
+    ) -> None:
+        if any(
+            value is None
+            for value in (
+                opening_balance,
+                total_deposits,
+                total_withdrawals,
+                closing_balance,
+            )
+        ):
+            raise PDFProcessingError(
+                "EQ Bank statement summary totals were not found. Extraction "
+                "was not accepted because completeness could not be verified."
+            )
+
+        previous_balance = opening_balance
+        detail_deposits = Decimal("0.00")
+        detail_withdrawals = Decimal("0.00")
+
+        for row_number, row in enumerate(
+            transactions.to_dict("records"),
+            start=1,
+        ):
+            withdrawal_text = row["Withdrawals"]
+            deposit_text = row["Deposits"]
+            has_withdrawal = bool(withdrawal_text)
+            has_deposit = bool(deposit_text)
+
+            if has_withdrawal and has_deposit:
+                raise PDFProcessingError(
+                    "EQ Bank transaction row has both withdrawal and deposit."
+                )
+
+            if not has_withdrawal and not has_deposit:
+                raise PDFProcessingError(
+                    "EQ Bank transaction row has neither withdrawal nor deposit."
+                )
+
+            withdrawal = (
+                self._parse_amount(withdrawal_text)
+                if has_withdrawal
+                else Decimal("0.00")
+            )
+            deposit = (
+                self._parse_amount(deposit_text)
+                if has_deposit
+                else Decimal("0.00")
+            )
+            balance = self._parse_amount(row["Balance"])
+            expected = previous_balance - withdrawal + deposit
+
+            if expected != balance:
+                raise PDFProcessingError(
+                    "EQ Bank transaction balance does not reconcile "
+                    f"at row {row_number}."
+                )
+
+            detail_withdrawals += withdrawal
+            detail_deposits += deposit
+            previous_balance = balance
+
+        if previous_balance != closing_balance:
+            raise PDFProcessingError(
+                "EQ Bank final transaction balance does not match the "
+                "closing balance."
+            )
+
+        if opening_balance + detail_deposits - detail_withdrawals != closing_balance:
+            raise PDFProcessingError(
+                "EQ Bank transaction details do not reconcile with the "
+                "closing balance."
+            )
+
+        if detail_deposits != total_deposits:
+            raise PDFProcessingError(
+                "EQ Bank detail deposits do not match the statement total."
+            )
+
+        if detail_withdrawals != total_withdrawals:
+            raise PDFProcessingError(
+                "EQ Bank detail withdrawals do not match the statement total."
+            )
+
     # Shared processing -------------------------------------------------------
 
     def extract_transactions(self, pdf_path: str | Path) -> ExtractionResult:
@@ -4083,6 +4729,12 @@ class VisaPDFProcessor:
         tangerine_opening_balance: Decimal | None = None
         tangerine_current_balance: Decimal | None = None
         tangerine_closing_balance: Decimal | None = None
+        eq_statement_start: date | None = None
+        eq_statement_end: date | None = None
+        eq_opening_balance: Decimal | None = None
+        eq_total_deposits: Decimal | None = None
+        eq_total_withdrawals: Decimal | None = None
+        eq_closing_balance: Decimal | None = None
         td_previous_balance: Decimal | None = None
         td_new_balance: Decimal | None = None
         td_statement_start: date | None = None
@@ -4406,6 +5058,56 @@ class VisaPDFProcessor:
 
                         if page_closing_balance is not None:
                             tangerine_closing_balance = page_closing_balance
+                    elif self.profile.parser == "eq_bank_account":
+                        (
+                            page_statement_start,
+                            page_statement_end,
+                        ) = self._extract_eq_statement_period(
+                            page_text
+                        )
+
+                        if (
+                            page_statement_start is not None
+                            and page_statement_end is not None
+                        ):
+                            page_period = (
+                                page_statement_start,
+                                page_statement_end,
+                            )
+
+                            if eq_statement_start is not None:
+                                current_period = (
+                                    eq_statement_start,
+                                    eq_statement_end,
+                                )
+
+                                if page_period != current_period:
+                                    raise PDFProcessingError(
+                                        "Conflicting EQ Bank statement "
+                                        "periods were found in the PDF."
+                                    )
+
+                            eq_statement_start = page_statement_start
+                            eq_statement_end = page_statement_end
+
+                        page_summary = self._extract_eq_summary(
+                            page
+                        )
+
+                        if "opening" in page_summary:
+                            eq_opening_balance = page_summary["opening"]
+                        if "deposits" in page_summary:
+                            eq_total_deposits = page_summary["deposits"]
+                        if "withdrawals" in page_summary:
+                            eq_total_withdrawals = page_summary["withdrawals"]
+                        if "closing" in page_summary:
+                            eq_closing_balance = page_summary["closing"]
+
+                        page_rows = self._extract_eq_page_transactions(
+                            page,
+                            eq_statement_start,
+                            eq_statement_end,
+                        )
                     elif self.profile.parser == "td_visa_credit_card":
                         (
                             page_statement_start,
@@ -4805,6 +5507,25 @@ class VisaPDFProcessor:
                 statement_end_date=tangerine_statement_end,
             )
 
+        if self.profile.parser == "eq_bank_account":
+            if (
+                eq_statement_start is None
+                or eq_statement_end is None
+            ):
+                raise PDFProcessingError(
+                    "EQ Bank statement period was not found. Transaction "
+                    "years cannot be resolved safely."
+                )
+
+            metadata = StatementMetadata(
+                source_file=metadata.source_file,
+                profile_id=metadata.profile_id,
+                institution=metadata.institution,
+                document_type=metadata.document_type,
+                statement_start_date=eq_statement_start,
+                statement_end_date=eq_statement_end,
+            )
+
         if self.profile.parser == "td_visa_credit_card":
             if (
                 td_statement_start is None
@@ -4907,6 +5628,14 @@ class VisaPDFProcessor:
                 tangerine_opening_balance,
                 tangerine_current_balance,
                 tangerine_closing_balance,
+            )
+        elif self.profile.parser == "eq_bank_account":
+            self._validate_eq_reconciliation(
+                transactions,
+                eq_opening_balance,
+                eq_total_deposits,
+                eq_total_withdrawals,
+                eq_closing_balance,
             )
         elif self.profile.parser == "td_visa_credit_card":
             self._validate_td_balance(
