@@ -242,6 +242,16 @@ def _table_geometry(
         for word in words
         if _word_token(word).startswith("amount")
     ]
+    withdrawal_words = [
+        word
+        for word in words
+        if _word_token(word).startswith("withdrawal")
+    ]
+    deposit_words = [
+        word
+        for word in words
+        if _word_token(word).startswith("deposit")
+    ]
     balance_words = [
         word
         for word in words
@@ -300,6 +310,46 @@ def _table_geometry(
             description_left,
             amount_left,
             balance_left,
+        )
+
+    date_words = [
+        word
+        for word in words
+        if _word_token(word) == "date"
+    ]
+
+    for description in description_words:
+        same_line_date = [
+            word
+            for word in date_words
+            if abs(word.y0 - description.y0) <= 3.0
+            and word.x0 < description.x0
+        ]
+        same_line_amount = [
+            word
+            for word in (*withdrawal_words, *deposit_words)
+            if abs(word.y0 - description.y0) <= 3.0
+            and word.x0 > description.x0
+        ]
+        same_line_balance = [
+            word
+            for word in balance_words
+            if abs(word.y0 - description.y0) <= 3.0
+            and word.x0 > description.x0
+        ]
+
+        if (
+            not same_line_date
+            or not same_line_amount
+            or not same_line_balance
+        ):
+            continue
+
+        return (
+            min(word.x0 for word in same_line_date),
+            description.x0,
+            min(word.x0 for word in same_line_amount),
+            min(word.x0 for word in same_line_balance),
         )
 
     return None
@@ -640,17 +690,29 @@ def _redact_etransfer_names_on_page(
     index = 0
 
     while index <= len(description_words) - 4:
-        current = description_words[index:index + 4]
+        current = description_words[index:index + 5]
         tokens = [
             _word_token(word)
             for word in current
         ]
+        prefix_word_offset: int | None = None
 
         if (
             tokens[0] == "interac"
             and tokens[1] == "e-transfer"
             and tokens[2] in ("from", "to")
         ):
+            prefix_word_offset = 2
+        elif (
+            len(tokens) >= 4
+            and tokens[0] == "interac"
+            and tokens[1] == "e-transfer"
+            and tokens[2] == "received"
+            and tokens[3] == "from"
+        ):
+            prefix_word_offset = 3
+
+        if prefix_word_offset is not None:
             band = _band_for_word(
                 current[0],
                 start_ys=start_ys,
@@ -673,7 +735,7 @@ def _redact_etransfer_names_on_page(
 
             prefix_position = _positioned_word_index(
                 band_words,
-                current[2],
+                current[prefix_word_offset],
             )
 
             if prefix_position is None:
