@@ -117,6 +117,21 @@ class TransactionNormalizerTest(unittest.TestCase):
                 },
             ),
             (
+                "tangerine_chequing_account_v1",
+                "bank_account_statement",
+                {
+                    "Date": "2025-03-14",
+                    "Description": "Deposit",
+                    "Withdrawals ($)": "",
+                    "Deposits ($)": "$100.00",
+                    "Balance ($)": "$500.00",
+                },
+                {
+                    "deposit": "100.00",
+                    "balance": "500.00",
+                },
+            ),
+            (
                 "simplii_loc_v1",
                 "line_of_credit_statement",
                 {

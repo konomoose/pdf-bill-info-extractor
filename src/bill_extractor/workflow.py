@@ -20,6 +20,7 @@ from .profile_loader import (
     discover_profiles,
 )
 from .transaction_normalizer import (
+    NORMALIZED_COLUMNS,
     NormalizationError,
     normalize_transactions,
 )
@@ -142,8 +143,109 @@ def _normalize_selected_pdf_files(
     )
 
 
+def _normalized_export_columns(
+    profile: ExtractionProfile,
+) -> tuple[str, ...]:
+    return (
+        profile.normalized_output_columns
+        if profile.normalized_output_columns is not None
+        else tuple(NORMALIZED_COLUMNS)
+    )
+
+
+def _project_normalized_for_export(
+    normalized: pd.DataFrame,
+    profile: ExtractionProfile,
+) -> pd.DataFrame:
+    columns = _normalized_export_columns(profile)
+    missing = [
+        column
+        for column in columns
+        if column not in normalized.columns
+    ]
+
+    if missing:
+        raise WorkflowError(
+            "Normalized output is missing configured export columns: "
+            + ", ".join(missing)
+            + "."
+        )
+
+    return normalized.loc[:, list(columns)].copy()
+
+
+def _output_columns_for_yearly(
+    profiles: tuple[ExtractionProfile, ...],
+) -> tuple[str, ...] | None:
+    configured = {
+        profile.normalized_output_columns
+        for profile in profiles
+        if profile.normalized_output_columns is not None
+    }
+
+    if not configured:
+        return None
+
+    if len(configured) != 1 or any(
+        profile.normalized_output_columns is None
+        for profile in profiles
+    ):
+        raise WorkflowError(
+            "Profiles sharing an output folder must use the same "
+            "normalized output column configuration."
+        )
+
+    return next(iter(configured))
+
+
+def _expand_projected_normalized_frame(
+    frame: pd.DataFrame,
+    csv_path: Path,
+    output_root: Path,
+    profiles: tuple[ExtractionProfile, ...],
+) -> pd.DataFrame:
+    if tuple(frame.columns) == tuple(NORMALIZED_COLUMNS):
+        return frame.loc[:, list(NORMALIZED_COLUMNS)].copy()
+
+    matches = [
+        profile
+        for profile in profiles
+        if (
+            profile.normalized_output_columns is not None
+            and tuple(frame.columns)
+            == profile.normalized_output_columns
+        )
+    ]
+
+    if len(matches) != 1:
+        raise WorkflowError(
+            "Normalized statement CSV has an unexpected schema: "
+            f"{csv_path}."
+        )
+
+    profile = matches[0]
+    expanded = pd.DataFrame(
+        "",
+        index=frame.index,
+        columns=list(NORMALIZED_COLUMNS),
+    )
+
+    for column in frame.columns:
+        expanded[column] = frame[column]
+
+    expanded["institution"] = profile.institution
+    expanded["account_type"] = profile.document_type
+    expanded["profile_id"] = profile.profile_id
+    expanded["source_file"] = (
+        csv_path.relative_to(output_root).as_posix()
+    )
+
+    return expanded
+
+
 def _load_normalized_statement_frames(
     output_root: Path,
+    profiles: tuple[ExtractionProfile, ...],
 ) -> list[pd.DataFrame]:
     """
     Load all normalized statement CSVs below an output root.
@@ -166,7 +268,14 @@ def _load_normalized_statement_frames(
         )
 
         if not frame.empty:
-            frames.append(frame)
+            frames.append(
+                _expand_projected_normalized_frame(
+                    frame,
+                    csv_path,
+                    output_root,
+                    profiles,
+                )
+            )
 
     return frames
 
@@ -221,6 +330,31 @@ def _normalized_csv_profile_ids(
         for value in frame["profile_id"]
         if str(value).strip()
     }
+
+
+def _normalized_csv_has_projected_schema(
+    normalized_csv: Path,
+    profile: ExtractionProfile,
+) -> bool:
+    if profile.normalized_output_columns is None:
+        return False
+
+    try:
+        frame = pd.read_csv(
+            normalized_csv,
+            dtype=str,
+            keep_default_na=False,
+            nrows=0,
+        )
+    except (
+        OSError,
+        ValueError,
+        pd.errors.EmptyDataError,
+        pd.errors.ParserError,
+    ):
+        return False
+
+    return tuple(frame.columns) == profile.normalized_output_columns
 
 
 def _remove_statement_files(
@@ -295,7 +429,7 @@ def _remove_statement_files(
 
 def _remove_stale_statement_outputs(
     output_root: Path,
-    profile_id: str,
+    profile: ExtractionProfile,
     protected_normalized_paths: set[Path],
 ) -> int:
     protected = {
@@ -320,7 +454,13 @@ def _remove_stale_statement_outputs(
             )
         )
 
-        if profile_ids != {profile_id}:
+        if (
+            profile_ids != {profile.profile_id}
+            and not _normalized_csv_has_projected_schema(
+                normalized_csv,
+                profile,
+            )
+        ):
             continue
 
         stale_normalized.append(
@@ -885,7 +1025,10 @@ def run_extraction_workflow(
                 _write_statement_csvs(
                     result.transactions,
                     raw_csv,
-                    normalized,
+                    _project_normalized_for_export(
+                        normalized,
+                        profile,
+                    ),
                     normalized_csv,
                 )
 
@@ -962,7 +1105,7 @@ def run_extraction_workflow(
     # shares the same output root and profile ID.
     for (
         output_root,
-        profile_id,
+            profile_id,
     ), protected_paths in sorted(
         complete_scan_protected.items(),
         key=lambda item: (
@@ -973,7 +1116,13 @@ def run_extraction_workflow(
         removed_count = (
             _remove_stale_statement_outputs(
                 output_root,
-                profile_id,
+                next(
+                    profile
+                    for profile in selected_profiles
+                    if profile.profile_id == profile_id
+                    and profile.resolve_output_folder().resolve()
+                    == output_root
+                ),
                 protected_paths,
             )
         )
@@ -989,12 +1138,23 @@ def run_extraction_workflow(
         consolidation_output_roots,
         key=lambda path: str(path).casefold(),
     ):
+        output_profiles = tuple(
+            profile
+            for profile in selected_profiles
+            if profile.resolve_output_folder().resolve()
+            == output_root
+        )
+
         frames = (
             _load_normalized_statement_frames(
-                output_root
+                output_root,
+                output_profiles,
             )
         )
         slug = grouped_slugs[output_root]
+        yearly_output_columns = (
+            _output_columns_for_yearly(output_profiles)
+        )
 
         try:
             yearly_frames = (
@@ -1007,6 +1167,7 @@ def run_extraction_workflow(
                     frames,
                     output_root=output_root,
                     institution_slug=slug,
+                    output_columns=yearly_output_columns,
                 )
             )
         except (

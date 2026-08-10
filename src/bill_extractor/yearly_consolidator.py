@@ -249,10 +249,17 @@ def _managed_yearly_csv_paths(
 def _stage_yearly_csv(
     transactions: pd.DataFrame,
     output_path: Path,
+    output_columns: tuple[str, ...] | None = None,
 ) -> Path:
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
+    )
+
+    exported = (
+        transactions.loc[:, list(output_columns)].copy()
+        if output_columns is not None
+        else transactions
     )
 
     temporary_path: Path | None = None
@@ -271,7 +278,7 @@ def _stage_yearly_csv(
                 temporary_file.name
             )
 
-            transactions.to_csv(
+            exported.to_csv(
                 temporary_file,
                 index=False,
                 lineterminator="\n",
@@ -404,6 +411,7 @@ def write_yearly_transaction_csvs(
     *,
     output_root: str | Path,
     institution_slug: str,
+    output_columns: tuple[str, ...] | None = None,
 ) -> dict[int, Path]:
     """
     Write one consolidated CSV per transaction year.
@@ -422,6 +430,33 @@ def write_yearly_transaction_csvs(
             "Institution slug must contain only lowercase "
             "letters, numbers, and single underscores."
         )
+
+    if output_columns is not None:
+        unknown = [
+            column
+            for column in output_columns
+            if column not in NORMALIZED_COLUMNS
+        ]
+        duplicates = [
+            column
+            for index, column in enumerate(output_columns)
+            if column in output_columns[:index]
+        ]
+
+        if unknown:
+            raise ConsolidationError(
+                "Yearly output columns contain unknown normalized "
+                "columns: "
+                + ", ".join(unknown)
+                + "."
+            )
+
+        if duplicates:
+            raise ConsolidationError(
+                "Yearly output columns contain duplicate columns: "
+                + ", ".join(duplicates)
+                + "."
+            )
 
     root = Path(output_root)
 
@@ -448,6 +483,7 @@ def write_yearly_transaction_csvs(
             staged[target] = _stage_yearly_csv(
                 yearly[year],
                 target,
+                output_columns,
             )
 
     except Exception:

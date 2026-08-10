@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .transaction_normalizer import NORMALIZED_COLUMNS
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROFILES_FOLDER = PROJECT_ROOT / "config" / "profiles"
 DEFAULT_PROFILE_PATH = DEFAULT_PROFILES_FOLDER / "cibc_credit_card.json"
@@ -32,6 +34,7 @@ class ExtractionProfile:
     line_tolerance: float
     continuation_gap: float
     source_path: Path
+    normalized_output_columns: tuple[str, ...] | None = None
 
     def resolve_input_folder(self) -> Path:
         return _resolve_project_path(self.input_folder)
@@ -74,6 +77,49 @@ def _require_string_list(
                 f"Every entry in profile field '{key}' must be a non-empty string."
             )
         cleaned.append(item.strip())
+
+    return tuple(cleaned)
+
+
+def _optional_normalized_output_columns(
+    data: dict[str, Any],
+) -> tuple[str, ...] | None:
+    value = data.get("normalized_output_columns")
+
+    if value is None:
+        return None
+
+    if not isinstance(value, list) or not value:
+        raise ProfileError(
+            "Profile field 'normalized_output_columns' must be a non-empty list."
+        )
+
+    known = set(NORMALIZED_COLUMNS)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ProfileError(
+                "Every entry in profile field 'normalized_output_columns' "
+                "must be a non-empty string."
+            )
+
+        column = item.strip()
+        if column not in known:
+            raise ProfileError(
+                "Profile field 'normalized_output_columns' contains "
+                f"unknown normalized column: {column!r}."
+            )
+
+        if column in seen:
+            raise ProfileError(
+                "Profile field 'normalized_output_columns' contains "
+                f"a duplicate column: {column!r}."
+            )
+
+        seen.add(column)
+        cleaned.append(column)
 
     return tuple(cleaned)
 
@@ -146,6 +192,9 @@ def load_profile(profile_path: str | Path | None = None) -> ExtractionProfile:
         line_tolerance=line_tolerance,
         continuation_gap=continuation_gap,
         source_path=path,
+        normalized_output_columns=(
+            _optional_normalized_output_columns(data)
+        ),
     )
 
 

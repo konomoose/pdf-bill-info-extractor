@@ -40,8 +40,11 @@ class InstitutionCollectionResult:
 
 @dataclass(frozen=True)
 class _CollectionEntry:
+    institution: str
     profile_id: str
     profile_display_name: str
+    account_type: str
+    normalized_output_columns: tuple[str, ...] | None
     source_path: Path
     source_relative_path: str
     destination_name: str
@@ -266,9 +269,14 @@ def _collection_entries(
             destinations[destination_name.casefold()] = source_path
             entries.append(
                 _CollectionEntry(
+                    institution=profile.institution,
                     profile_id=profile.profile_id,
                     profile_display_name=(
                         profile.display_name
+                    ),
+                    account_type=profile.document_type,
+                    normalized_output_columns=(
+                        profile.normalized_output_columns
                     ),
                     source_path=source_path,
                     source_relative_path=source_relative_path,
@@ -447,16 +455,33 @@ def _read_normalized_source(
             f"{entry.profile_id}: {entry.source_relative_path}."
         ) from exc
 
-    if tuple(frame.columns) != tuple(NORMALIZED_COLUMNS):
+    if tuple(frame.columns) == tuple(NORMALIZED_COLUMNS):
+        prepared = frame.loc[
+            :,
+            list(NORMALIZED_COLUMNS),
+        ].copy()
+    elif (
+        entry.normalized_output_columns is not None
+        and tuple(frame.columns) == entry.normalized_output_columns
+    ):
+        prepared = pd.DataFrame(
+            "",
+            index=frame.index,
+            columns=list(NORMALIZED_COLUMNS),
+        )
+
+        for column in frame.columns:
+            prepared[column] = frame[column]
+
+        prepared["institution"] = entry.institution
+        prepared["account_type"] = entry.account_type
+        prepared["profile_id"] = entry.profile_id
+        prepared["source_file"] = entry.source_relative_path
+    else:
         raise InstitutionCollectionError(
             "Normalized source CSV has an unexpected schema for "
             f"{entry.profile_id}: {entry.source_relative_path}."
         )
-
-    prepared = frame.loc[
-        :,
-        list(NORMALIZED_COLUMNS),
-    ].copy()
 
     prepared.insert(
         2,

@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from dataclasses import replace
 import json
 import unittest
 from unittest.mock import patch
@@ -427,6 +428,71 @@ class InstitutionCollectorTest(unittest.TestCase):
                     entry["destination_path"]
                     for entry in entries
                 ),
+            )
+
+    def test_projected_normalized_source_csv_is_expanded_for_combined_csv(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "csv_output" / "tangerine_chequing"
+            collection_base = root / "collections"
+            profile = replace(
+                make_profile(
+                    root,
+                    output_root,
+                    profile_id="tangerine_chequing_account_v1",
+                    institution="Tangerine Bank",
+                    display_name="Tangerine Chequing",
+                ),
+                document_type="bank_account_statement",
+                normalized_output_columns=(
+                    "transaction_date",
+                    "description",
+                    "withdrawal",
+                    "deposit",
+                    "balance",
+                ),
+            )
+
+            write_normalized(
+                output_root,
+                "statement_normalized_transactions.csv",
+                (
+                    "transaction_date,description,withdrawal,deposit,balance\n"
+                    "2026-01-10,Coffee,12.34,,987.66\n"
+                ).encode("utf-8"),
+            )
+
+            result = collect_institution_statement_csvs(
+                [profile],
+                "Tangerine Bank",
+                collection_base=collection_base,
+            )
+
+            combined = read_combined(
+                result.combined_csv_path
+            )
+
+            self.assertEqual(
+                result.combined_transaction_count,
+                1,
+            )
+            self.assertEqual(
+                combined.loc[0, "institution"],
+                "Tangerine Bank",
+            )
+            self.assertEqual(
+                combined.loc[0, "profile_id"],
+                "tangerine_chequing_account_v1",
+            )
+            self.assertEqual(
+                combined.loc[0, "account_type"],
+                "bank_account_statement",
+            )
+            self.assertEqual(
+                combined.loc[0, "withdrawal"],
+                "12.34",
             )
 
     def test_single_profile_institution_is_collected(
