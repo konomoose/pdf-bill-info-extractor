@@ -39,6 +39,19 @@ class InstitutionCollectionResult:
 
 
 @dataclass(frozen=True)
+class AccountCollectionResult:
+    profile_id: str
+    profile_display_name: str
+    account_slug: str
+    output_folder: Path
+    combined_csv_path: Path
+    manifest_path: Path
+    collected_count: int
+    combined_transaction_count: int
+    duplicate_statement_copies_skipped: int = 0
+
+
+@dataclass(frozen=True)
 class _CollectionEntry:
     institution: str
     profile_id: str
@@ -53,6 +66,7 @@ class _CollectionEntry:
 
 _NORMALIZED_SUFFIX = "_normalized_transactions.csv"
 _MANIFEST_NAME = ".collection_manifest.json"
+_ACCOUNT_MANIFEST_NAME = ".account_collection_manifest.json"
 _ALL_STATEMENTS_FOLDER = "all_statements"
 _MANIFEST_VERSION = 1
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -96,6 +110,29 @@ def institution_slug(institution: str) -> str:
     if not slug:
         raise InstitutionCollectionError(
             "Institution name cannot produce a usable collection slug."
+        )
+
+    return slug
+
+
+def account_slug(profile: ExtractionProfile) -> str:
+    output_name = profile.resolve_output_folder().name
+    slug = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        output_name.casefold(),
+    ).strip("_")
+
+    if not slug:
+        slug = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            profile.profile_id.casefold(),
+        ).strip("_")
+
+    if not slug:
+        raise InstitutionCollectionError(
+            "Profile cannot produce a usable account collection slug."
         )
 
     return slug
@@ -601,6 +638,220 @@ def _combined_transactions_frame(
     )
 
 
+def _file_digest(
+    path: Path,
+) -> str:
+    digest = sha256()
+
+    try:
+        with path.open("rb") as source_file:
+            for chunk in iter(
+                lambda: source_file.read(1024 * 1024),
+                b"",
+            ):
+                digest.update(chunk)
+    except OSError as exc:
+        raise InstitutionCollectionError(
+            "Could not read normalized source CSV for duplicate detection: "
+            f"{path.name}."
+        ) from exc
+
+    return digest.hexdigest()
+
+
+def _deduplicated_account_source_paths(
+    source_paths: Sequence[Path],
+    output_root: Path,
+) -> tuple[tuple[Path, ...], int]:
+    resolved_sources = tuple(
+        path.resolve()
+        for path in source_paths
+    )
+    by_name: dict[str, list[Path]] = {}
+
+    for source_path in resolved_sources:
+        by_name.setdefault(
+            source_path.name.casefold(),
+            [],
+        ).append(source_path)
+
+    selected: list[Path] = []
+    duplicate_skipped = 0
+
+    for filename_key in sorted(by_name):
+        candidates = sorted(
+            by_name[filename_key],
+            key=lambda path: (
+                path.relative_to(output_root).as_posix().casefold(),
+                path.relative_to(output_root).as_posix(),
+            ),
+        )
+
+        if len(candidates) == 1:
+            selected.append(candidates[0])
+            continue
+
+        digests = {
+            _file_digest(candidate)
+            for candidate in candidates
+        }
+
+        if len(digests) != 1:
+            relative_paths = ", ".join(
+                candidate.relative_to(output_root).as_posix()
+                for candidate in candidates
+            )
+            raise InstitutionCollectionError(
+                "Multiple normalized statement CSV copies share the same "
+                "filename but have different contents: "
+                f"{relative_paths}."
+            )
+
+        selected.append(candidates[0])
+        duplicate_skipped += len(candidates) - 1
+
+    return (
+        tuple(
+            sorted(
+                selected,
+                key=lambda path: (
+                    path.relative_to(output_root).as_posix().casefold(),
+                    path.relative_to(output_root).as_posix(),
+                ),
+            )
+        ),
+        duplicate_skipped,
+    )
+
+
+def _account_entries(
+    profile: ExtractionProfile,
+) -> tuple[tuple[_CollectionEntry, ...], int]:
+    output_root = profile.resolve_output_folder().resolve()
+    source_paths = _deduplicated_account_source_paths(
+        _normalized_statement_paths(output_root),
+        output_root,
+    )
+    entries = [
+        _CollectionEntry(
+            institution=profile.institution,
+            profile_id=profile.profile_id,
+            profile_display_name=profile.display_name,
+            account_type=profile.document_type,
+            normalized_output_columns=profile.normalized_output_columns,
+            source_path=source_path,
+            source_relative_path=source_path.relative_to(
+                output_root
+            ).as_posix(),
+            destination_name=source_path.name,
+            destination_path=source_path,
+        )
+        for source_path in source_paths[0]
+    ]
+
+    return (
+        tuple(
+            sorted(
+                entries,
+                key=lambda entry: (
+                    entry.source_relative_path.casefold(),
+                    str(entry.source_path).casefold(),
+                ),
+            )
+        ),
+        source_paths[1],
+    )
+
+
+def _account_combined_transactions_frame(
+    profile: ExtractionProfile,
+    entries: Sequence[_CollectionEntry],
+) -> pd.DataFrame:
+    frames = [
+        frame
+        for frame in (
+            _read_normalized_source(entry)
+            for entry in entries
+        )
+        if not frame.empty
+    ]
+    output_columns = list(
+        profile.normalized_output_columns
+        if profile.normalized_output_columns is not None
+        else NORMALIZED_COLUMNS
+    )
+
+    if not frames:
+        return pd.DataFrame(
+            columns=output_columns,
+        )
+
+    combined = pd.concat(
+        frames,
+        ignore_index=True,
+    )
+
+    _validate_combined_dates(combined)
+
+    combined = combined.sort_values(
+        by=[
+            "transaction_date",
+            "posting_date",
+            "effective_date",
+            "source_relative_path",
+            "_row_sequence",
+        ],
+        kind="mergesort",
+    )
+
+    return (
+        combined.loc[
+            :,
+            output_columns,
+        ]
+        .reset_index(drop=True)
+    )
+
+
+def _account_manifest_payload(
+    *,
+    profile: ExtractionProfile,
+    slug: str,
+    collection_root: Path,
+    combined_csv_path: Path,
+    combined_transaction_count: int,
+    duplicate_statement_copies_skipped: int,
+    entries: Sequence[_CollectionEntry],
+) -> dict[str, object]:
+    return {
+        "account_slug": slug,
+        "duplicate_statement_copies_skipped": (
+            duplicate_statement_copies_skipped
+        ),
+        "entries": [],
+        "managed_artifacts": [
+            {
+                "kind": "combined_transactions",
+                "path": (
+                    combined_csv_path
+                    .relative_to(collection_root)
+                    .as_posix()
+                ),
+                "transaction_count": combined_transaction_count,
+            }
+        ],
+        "profile_display_name": profile.display_name,
+        "profile_id": profile.profile_id,
+        "source_statements": [
+            {
+                "source_relative_path": entry.source_relative_path,
+            }
+            for entry in entries
+        ],
+        "version": _MANIFEST_VERSION,
+    }
+
+
 def _write_combined_temp(
     transactions: pd.DataFrame,
     combined_csv_path: Path,
@@ -1059,6 +1310,91 @@ def collect_institution_statement_csvs(
         collected_count=len(entries),
         combined_transaction_count=len(combined_transactions),
         stale_removed_count=len(stale_paths),
+    )
+
+
+def collect_profile_account_statement_csvs(
+    selected_profile: ExtractionProfile,
+) -> AccountCollectionResult:
+    output_folder = selected_profile.resolve_output_folder().resolve()
+    slug = account_slug(selected_profile)
+    combined_csv_path = (
+        output_folder
+        / f"{slug}_all_transactions.csv"
+    )
+    manifest_path = (
+        output_folder
+        / _ACCOUNT_MANIFEST_NAME
+    )
+
+    previous_by_destination = _load_previous_manifest(
+        manifest_path,
+        expected_combined_artifact_path=combined_csv_path,
+    )
+
+    entries, duplicate_statement_copies_skipped = _account_entries(
+        selected_profile
+    )
+    combined_transactions = _account_combined_transactions_frame(
+        selected_profile,
+        entries,
+    )
+
+    _protect_unmanaged_destinations(
+        (),
+        previous_by_destination,
+        extra_targets=(combined_csv_path,),
+    )
+
+    manifest_payload = _account_manifest_payload(
+        profile=selected_profile,
+        slug=slug,
+        collection_root=output_folder,
+        combined_csv_path=combined_csv_path,
+        combined_transaction_count=len(combined_transactions),
+        duplicate_statement_copies_skipped=(
+            duplicate_statement_copies_skipped
+        ),
+        entries=entries,
+    )
+    staged = {
+        combined_csv_path: _write_combined_temp(
+            combined_transactions,
+            combined_csv_path,
+        )
+    }
+
+    try:
+        manifest_temp = _write_manifest_temp(
+            manifest_path,
+            manifest_payload,
+        )
+    except Exception:
+        for temporary_path in staged.values():
+            temporary_path.unlink(
+                missing_ok=True
+            )
+        raise
+
+    _commit_collection(
+        staged=staged,
+        manifest_path=manifest_path,
+        manifest_temp=manifest_temp,
+        stale_paths=set(),
+    )
+
+    return AccountCollectionResult(
+        profile_id=selected_profile.profile_id,
+        profile_display_name=selected_profile.display_name,
+        account_slug=slug,
+        output_folder=output_folder,
+        combined_csv_path=combined_csv_path,
+        manifest_path=manifest_path,
+        collected_count=len(entries),
+        combined_transaction_count=len(combined_transactions),
+        duplicate_statement_copies_skipped=(
+            duplicate_statement_copies_skipped
+        ),
     )
 
 

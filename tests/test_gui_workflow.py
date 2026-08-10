@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from src.bill_extractor.institution_collector import (
-    InstitutionCollectionResult,
+    AccountCollectionResult,
 )
 from src.bill_extractor.pdf_redaction import (
     REPLACE_REDACTED_PDF_ERROR,
@@ -679,49 +679,40 @@ class GUIWorkflowTest(unittest.TestCase):
     def test_collection_result_is_reported_privately(
         self,
     ) -> None:
-        result = InstitutionCollectionResult(
-            institution="Test Bank",
-            institution_slug="test_bank",
-            collection_root=Path(
-                "csv_output/institution_collections/test_bank"
-            ),
-            all_statements_folder=Path(
-                "csv_output/institution_collections/"
-                "test_bank/all_statements"
-            ),
+        result = AccountCollectionResult(
+            profile_id="test_profile_v1",
+            profile_display_name="Test Account",
+            account_slug="test_account",
+            output_folder=Path("csv_output/test_account"),
             combined_csv_path=Path(
-                "csv_output/institution_collections/"
-                "test_bank/test_bank_all_transactions.csv"
+                "csv_output/test_account/test_account_all_transactions.csv"
             ),
             manifest_path=Path(
-                "csv_output/institution_collections/"
-                "test_bank/.collection_manifest.json"
+                "csv_output/test_account/.account_collection_manifest.json"
             ),
-            profile_ids=("test_profile_v1",),
             collected_count=3,
             combined_transaction_count=12,
-            stale_removed_count=1,
         )
 
         text = "\n".join(
             GUI_MODULE
-            .institution_collection_result_messages(result)
+            .account_collection_result_messages(result)
         )
 
         self.assertIn(
-            "INSTITUTION COLLECTION RESULTS",
+            "ACCOUNT COLLECTION RESULTS",
             text,
         )
         self.assertIn(
-            "Institution: Test Bank",
+            "Profile/account: Test Account",
             text,
         )
         self.assertIn(
-            "Collection folder:",
+            "Output folder:",
             text,
         )
         self.assertIn(
-            "configured output folders",
+            "selected profile's configured output folder",
             text,
         )
         self.assertIn(
@@ -733,11 +724,101 @@ class GUIWorkflowTest(unittest.TestCase):
             text,
         )
         self.assertIn(
-            "Combined CSV:",
+            "Duplicate statement copies skipped: 0",
             text,
         )
         self.assertIn(
-            "Stale managed files removed: 1",
+            "Combined CSV:",
+            text,
+        )
+
+    def test_collection_button_uses_account_wording(
+        self,
+    ) -> None:
+        _root, app = create_test_app(self)
+
+        self.assertEqual(
+            app.collect_btn.cget("text"),
+            "Collect Account CSVs",
+        )
+        self.assertIn(
+            "Collect Account CSVs",
+            app.folder_mode_info_var.get(),
+        )
+        self.assertIn(
+            "selected profile's configured output folder",
+            app.folder_mode_info_var.get(),
+        )
+
+    def test_collection_worker_uses_selected_profile_account(
+        self,
+    ) -> None:
+        _root, app = create_test_app(self)
+        result = AccountCollectionResult(
+            profile_id=app.active_profile.profile_id,
+            profile_display_name=app.active_profile.display_name,
+            account_slug="test_account",
+            output_folder=Path("csv_output/test_account"),
+            combined_csv_path=Path(
+                "csv_output/test_account/test_account_all_transactions.csv"
+            ),
+            manifest_path=Path(
+                "csv_output/test_account/.account_collection_manifest.json"
+            ),
+            collected_count=1,
+            combined_transaction_count=2,
+        )
+
+        with patch.object(
+            GUI_MODULE,
+            "collect_profile_account_statement_csvs",
+            return_value=result,
+        ) as collect_account:
+            with patch.object(
+                app.root,
+                "after",
+                side_effect=lambda _delay, callback, *args: callback(*args),
+            ):
+                with patch.object(app, "_collection_succeeded") as succeeded:
+                    app._collection_worker(app.active_profile)
+
+        collect_account.assert_called_once_with(app.active_profile)
+        succeeded.assert_called_once_with(result)
+
+    def test_collection_result_appends_to_processing_results(
+        self,
+    ) -> None:
+        _root, app = create_test_app(self)
+        app._append_result("Existing preparation output\n")
+        result = AccountCollectionResult(
+            profile_id="test_profile_v1",
+            profile_display_name="Test Account",
+            account_slug="test_account",
+            output_folder=Path("csv_output/test_account"),
+            combined_csv_path=Path(
+                "csv_output/test_account/test_account_all_transactions.csv"
+            ),
+            manifest_path=Path(
+                "csv_output/test_account/.account_collection_manifest.json"
+            ),
+            collected_count=1,
+            combined_transaction_count=2,
+        )
+
+        with patch.object(GUI_MODULE.messagebox, "showinfo"):
+            app._collection_succeeded(result)
+
+        text = app.results_text.get("1.0", "end-1c")
+        self.assertIn(
+            "Existing preparation output",
+            text,
+        )
+        self.assertIn(
+            "ACCOUNT COLLECTION RESULTS",
+            text,
+        )
+        self.assertIn(
+            "Profile/account: Test Account",
             text,
         )
 
