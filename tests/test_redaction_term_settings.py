@@ -8,6 +8,7 @@ from pathlib import Path
 from src.bill_extractor.pdf_preparation import PDFPreparationError
 from src.bill_extractor.redaction_term_settings import (
     load_redaction_account_settings,
+    load_redaction_account_settings_for_institution,
     load_redaction_term_accounts,
     load_redaction_terms_for_account,
     save_redaction_account_settings,
@@ -272,6 +273,216 @@ class RedactionTermSettingsTest(unittest.TestCase):
             self.assertNotIn("ADRIAN", text)
             self.assertNotIn("CORY", text)
             self.assertNotIn("SUTHERLAND", text)
+
+    def test_institution_terms_combine_legacy_account_terms(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            settings_path = Path(temporary_folder) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "institutions": {
+                            "Synthetic Bank": {
+                                "terms": [
+                                    "Synthetic Shared One",
+                                    "Synthetic Shared Two",
+                                ],
+                            },
+                        },
+                        "accounts": {
+                            "account_one": {
+                                "terms": [
+                                    "Synthetic Legacy One",
+                                ],
+                                "etransfer_keep_first_name_only": True,
+                            },
+                            "account_two": {
+                                "terms": [
+                                    "Synthetic Shared Two",
+                                    "Synthetic Legacy Two",
+                                ],
+                                "etransfer_keep_first_name_only": False,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            settings = load_redaction_account_settings_for_institution(
+                "account_one",
+                institution="Synthetic Bank",
+                institution_account_keys=(
+                    "account_one",
+                    "account_two",
+                ),
+                settings_path=settings_path,
+            )
+
+        self.assertEqual(
+            settings.terms,
+            (
+                "Synthetic Shared One",
+                "Synthetic Shared Two",
+                "Synthetic Legacy One",
+                "Synthetic Legacy Two",
+            ),
+        )
+        self.assertTrue(settings.etransfer_keep_first_name_only)
+
+    def test_saving_known_institution_migrates_terms_to_institution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            settings_path = Path(temporary_folder) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "accounts": {
+                            "account_one": {
+                                "terms": [
+                                    "Synthetic Removed Term",
+                                ],
+                                "etransfer_keep_first_name_only": False,
+                            },
+                            "account_two": {
+                                "terms": [
+                                    "Synthetic Removed Term",
+                                    "Synthetic Old Duplicate",
+                                ],
+                                "etransfer_keep_first_name_only": True,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            save_redaction_account_settings(
+                "account_one",
+                ("Synthetic Current Term",),
+                etransfer_keep_first_name_only=True,
+                institution="Synthetic Bank",
+                institution_account_keys=(
+                    "account_one",
+                    "account_two",
+                ),
+                settings_path=settings_path,
+            )
+
+            payload = json.loads(settings_path.read_text(encoding="utf-8"))
+            settings = load_redaction_account_settings_for_institution(
+                "account_two",
+                institution="Synthetic Bank",
+                institution_account_keys=(
+                    "account_one",
+                    "account_two",
+                ),
+                settings_path=settings_path,
+            )
+
+        self.assertEqual(
+            payload["institutions"],
+            {
+                "Synthetic Bank": {
+                    "terms": [
+                        "Synthetic Current Term",
+                    ],
+                },
+            },
+        )
+        self.assertEqual(
+            payload["accounts"]["account_one"]["terms"],
+            [],
+        )
+        self.assertEqual(
+            payload["accounts"]["account_two"]["terms"],
+            [],
+        )
+        self.assertEqual(
+            settings.terms,
+            ("Synthetic Current Term",),
+        )
+        self.assertTrue(
+            payload["accounts"]["account_one"][
+                "etransfer_keep_first_name_only"
+            ]
+        )
+        self.assertTrue(
+            payload["accounts"]["account_two"][
+                "etransfer_keep_first_name_only"
+            ]
+        )
+
+    def test_unmapped_account_keeps_account_level_behavior(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            settings_path = Path(temporary_folder) / "settings.json"
+
+            save_redaction_account_settings(
+                "unknown_account",
+                ("Synthetic Account Term",),
+                settings_path=settings_path,
+            )
+
+            payload = json.loads(settings_path.read_text(encoding="utf-8"))
+
+        self.assertNotIn("institutions", payload)
+        self.assertEqual(
+            payload,
+            {
+                "accounts": {
+                    "unknown_account": {
+                        "terms": [
+                            "Synthetic Account Term",
+                        ],
+                        "etransfer_keep_first_name_only": False,
+                    },
+                },
+            },
+        )
+
+    def test_unrelated_institution_does_not_receive_terms(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            settings_path = Path(temporary_folder) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "institutions": {
+                            "Synthetic Tangerine Bank": {
+                                "terms": [
+                                    "Synthetic Tangerine Term",
+                                ],
+                            },
+                        },
+                        "accounts": {
+                            "other_account": {
+                                "terms": [
+                                    "Synthetic Other Term",
+                                ],
+                                "etransfer_keep_first_name_only": False,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            settings = load_redaction_account_settings_for_institution(
+                "other_account",
+                institution="Synthetic Other Bank",
+                institution_account_keys=("other_account",),
+                settings_path=settings_path,
+            )
+
+        self.assertEqual(
+            settings.terms,
+            ("Synthetic Other Term",),
+        )
 
 
 if __name__ == "__main__":
