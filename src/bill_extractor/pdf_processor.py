@@ -214,12 +214,18 @@ SUPPORTED_PARSERS = {
     "cibc_credit_card",
     "simplii_chequing_account",
     "tangerine_chequing_account",
+    "tangerine_savings_account",
     "td_visa_credit_card",
     "rbc_visa_credit_card",
     "rbc_chequing_account",
     "rbc_loc",
     "triangle_mastercard",
     "capital_one_mastercard",
+}
+
+TANGERINE_ACCOUNT_PARSERS = {
+    "tangerine_chequing_account": "Tangerine Chequing",
+    "tangerine_savings_account": "Tangerine Savings",
 }
 
 
@@ -1894,9 +1900,9 @@ class VisaPDFProcessor:
                 "The PDF may contain an image-only or otherwise unreadable transaction page."
             )
 
-    # Tangerine Chequing parser ---------------------------------------------
+    # Tangerine account parser ----------------------------------------------
 
-    def _find_tangerine_chequing_header(
+    def _find_tangerine_account_header(
         self,
         page: fitz.Page,
     ) -> dict | None:
@@ -1987,7 +1993,7 @@ class VisaPDFProcessor:
 
         return None
 
-    def _line_to_tangerine_chequing_cells(
+    def _line_to_tangerine_account_cells(
         self,
         line: dict,
         header: dict,
@@ -2023,6 +2029,7 @@ class VisaPDFProcessor:
     @staticmethod
     def _extract_tangerine_statement_period(
         page_text: str,
+        parser_label: str = "Tangerine Chequing",
     ) -> tuple[date | None, date | None]:
         normalized = VisaPDFProcessor._normalize_text(page_text)
         match = TANGERINE_STATEMENT_PERIOD_RE.search(normalized)
@@ -2048,7 +2055,7 @@ class VisaPDFProcessor:
 
             if parsed_date is None:
                 raise PDFProcessingError(
-                    "Invalid Tangerine Chequing statement-period date: "
+                    f"Invalid {parser_label} statement-period date: "
                     f"{value!r}."
                 )
 
@@ -2057,7 +2064,7 @@ class VisaPDFProcessor:
         statement_start, statement_end = parsed_dates
         if statement_start > statement_end:
             raise PDFProcessingError(
-                "Tangerine Chequing statement-period start date is later "
+                f"{parser_label} statement-period start date is later "
                 "than its end date."
             )
 
@@ -2072,7 +2079,10 @@ class VisaPDFProcessor:
         return (word[1] + word[3]) / 2
 
     @staticmethod
-    def _parse_tangerine_transaction_date(value: str) -> date:
+    def _parse_tangerine_transaction_date(
+        value: str,
+        parser_label: str = "Tangerine Chequing",
+    ) -> date:
         normalized = VisaPDFProcessor._normalize_text(value)
 
         for date_format in (
@@ -2088,7 +2098,7 @@ class VisaPDFProcessor:
                 continue
 
         raise PDFProcessingError(
-            "Invalid Tangerine Chequing transaction date."
+            f"Invalid {parser_label} transaction date."
         )
 
     @staticmethod
@@ -2096,17 +2106,18 @@ class VisaPDFProcessor:
         transaction_date: date,
         statement_start: date | None,
         statement_end: date | None,
+        parser_label: str = "Tangerine Chequing",
     ) -> None:
         if statement_start is None or statement_end is None:
             return
 
         if not statement_start <= transaction_date <= statement_end:
             raise PDFProcessingError(
-                "Tangerine Chequing transaction date falls outside "
+                f"{parser_label} transaction date falls outside "
                 "the statement period."
             )
 
-    def _tangerine_chequing_cell_words(
+    def _tangerine_account_cell_words(
         self,
         words: Iterable[tuple],
         header: dict,
@@ -2158,17 +2169,18 @@ class VisaPDFProcessor:
             )
         )
 
-    def _find_tangerine_chequing_anchors(
+    def _find_tangerine_account_anchors(
         self,
         lines: list[dict],
         header: dict,
         statement_start: date | None,
         statement_end: date | None,
+        parser_label: str,
     ) -> list[dict]:
         anchors: list[dict] = []
 
         for line in lines:
-            cells = self._line_to_tangerine_chequing_cells(
+            cells = self._line_to_tangerine_account_cells(
                 line,
                 header,
             )
@@ -2181,12 +2193,14 @@ class VisaPDFProcessor:
                 continue
 
             parsed_date = self._parse_tangerine_transaction_date(
-                cells["date"]
+                cells["date"],
+                parser_label,
             )
             self._validate_tangerine_transaction_date(
                 parsed_date,
                 statement_start,
                 statement_end,
+                parser_label,
             )
 
             anchors.append(
@@ -2216,12 +2230,13 @@ class VisaPDFProcessor:
 
         return min(line["y_center"] for line in candidate_lines)
 
-    def _extract_tangerine_chequing_page_transactions(
+    def _extract_tangerine_account_page_transactions(
         self,
         page: fitz.Page,
         previous_balance: Decimal | None,
         statement_start: date | None,
         statement_end: date | None,
+        parser_label: str,
     ) -> tuple[
         list[dict[str, str]],
         Decimal | None,
@@ -2231,7 +2246,7 @@ class VisaPDFProcessor:
         if self._page_is_excluded(page.get_text("text")):
             return [], previous_balance, None, None
 
-        header = self._find_tangerine_chequing_header(page)
+        header = self._find_tangerine_account_header(page)
         if header is None:
             return [], previous_balance, None, None
 
@@ -2242,16 +2257,17 @@ class VisaPDFProcessor:
         ]
         lines = self._group_words_into_lines(words)
 
-        anchors = self._find_tangerine_chequing_anchors(
+        anchors = self._find_tangerine_account_anchors(
             lines,
             header,
             statement_start,
             statement_end,
+            parser_label,
         )
         if not anchors:
             return [], previous_balance, None, None
 
-        description_words = self._tangerine_chequing_cell_words(
+        description_words = self._tangerine_account_cell_words(
             words,
             header,
             "description",
@@ -2300,7 +2316,7 @@ class VisaPDFProcessor:
 
             if not description:
                 raise PDFProcessingError(
-                    "Tangerine Chequing transaction amount found without "
+                    f"{parser_label} transaction amount found without "
                     "a description."
                 )
 
@@ -2315,14 +2331,14 @@ class VisaPDFProcessor:
 
             if previous_balance is None:
                 raise PDFProcessingError(
-                    "Tangerine Chequing transaction found before an "
+                    f"{parser_label} transaction found before an "
                     "opening balance was established."
                 )
 
             amount = self._parse_amount(anchor["amount"])
             if amount < Decimal("0.00"):
                 raise PDFProcessingError(
-                    "Tangerine Chequing transaction amount was negative."
+                    f"{parser_label} transaction amount was negative."
                 )
 
             current_balance = self._parse_amount(anchor["balance"])
@@ -2336,7 +2352,7 @@ class VisaPDFProcessor:
                 deposit = ""
             else:
                 raise PDFProcessingError(
-                    "Tangerine Chequing transaction amount does not "
+                    f"{parser_label} transaction amount does not "
                     "reconcile with sequential balances."
                 )
 
@@ -2355,31 +2371,98 @@ class VisaPDFProcessor:
 
         return rows, previous_balance, opening_balance, closing_balance
 
-    def _validate_tangerine_chequing_balances(
+    def _extract_tangerine_chequing_page_transactions(
+        self,
+        page: fitz.Page,
+        previous_balance: Decimal | None,
+        statement_start: date | None,
+        statement_end: date | None,
+    ) -> tuple[
+        list[dict[str, str]],
+        Decimal | None,
+        Decimal | None,
+        Decimal | None,
+    ]:
+        return self._extract_tangerine_account_page_transactions(
+            page,
+            previous_balance,
+            statement_start,
+            statement_end,
+            "Tangerine Chequing",
+        )
+
+    def _extract_tangerine_savings_page_transactions(
+        self,
+        page: fitz.Page,
+        previous_balance: Decimal | None,
+        statement_start: date | None,
+        statement_end: date | None,
+    ) -> tuple[
+        list[dict[str, str]],
+        Decimal | None,
+        Decimal | None,
+        Decimal | None,
+    ]:
+        return self._extract_tangerine_account_page_transactions(
+            page,
+            previous_balance,
+            statement_start,
+            statement_end,
+            "Tangerine Savings",
+        )
+
+    def _validate_tangerine_account_balances(
         self,
         opening_balance: Decimal | None,
         final_transaction_balance: Decimal | None,
         closing_balance: Decimal | None,
+        parser_label: str,
     ) -> None:
         if opening_balance is None:
             raise PDFProcessingError(
-                "Tangerine Chequing opening balance was not found. "
+                f"{parser_label} opening balance was not found. "
                 "Extraction was not accepted because completeness could "
                 "not be verified."
             )
 
         if closing_balance is None:
             raise PDFProcessingError(
-                "Tangerine Chequing closing balance was not found. "
+                f"{parser_label} closing balance was not found. "
                 "Extraction was not accepted because completeness could "
                 "not be verified."
             )
 
         if final_transaction_balance != closing_balance:
             raise PDFProcessingError(
-                "Tangerine Chequing final transaction balance does not "
+                f"{parser_label} final transaction balance does not "
                 "match the closing balance."
             )
+
+    def _validate_tangerine_chequing_balances(
+        self,
+        opening_balance: Decimal | None,
+        final_transaction_balance: Decimal | None,
+        closing_balance: Decimal | None,
+    ) -> None:
+        self._validate_tangerine_account_balances(
+            opening_balance,
+            final_transaction_balance,
+            closing_balance,
+            "Tangerine Chequing",
+        )
+
+    def _validate_tangerine_savings_balances(
+        self,
+        opening_balance: Decimal | None,
+        final_transaction_balance: Decimal | None,
+        closing_balance: Decimal | None,
+    ) -> None:
+        self._validate_tangerine_account_balances(
+            opening_balance,
+            final_transaction_balance,
+            closing_balance,
+            "Tangerine Savings",
+        )
 
     # TD Visa credit-card parser ---------------------------------------------
 
@@ -4242,12 +4325,16 @@ class VisaPDFProcessor:
                                 page
                             )
                         )
-                    elif self.profile.parser == "tangerine_chequing_account":
+                    elif self.profile.parser in TANGERINE_ACCOUNT_PARSERS:
+                        tangerine_label = TANGERINE_ACCOUNT_PARSERS[
+                            self.profile.parser
+                        ]
                         (
                             page_statement_start,
                             page_statement_end,
                         ) = self._extract_tangerine_statement_period(
-                            page_text
+                            page_text,
+                            tangerine_label,
                         )
 
                         if (
@@ -4267,7 +4354,7 @@ class VisaPDFProcessor:
 
                                 if page_period != current_period:
                                     raise PDFProcessingError(
-                                        "Conflicting Tangerine Chequing "
+                                        f"Conflicting {tangerine_label} "
                                         "statement periods were found "
                                         "in the PDF."
                                     )
@@ -4279,17 +4366,30 @@ class VisaPDFProcessor:
                                 page_statement_end
                             )
 
-                        (
-                            page_rows,
-                            tangerine_current_balance,
-                            page_opening_balance,
-                            page_closing_balance,
-                        ) = self._extract_tangerine_chequing_page_transactions(
-                            page,
-                            tangerine_current_balance,
-                            tangerine_statement_start,
-                            tangerine_statement_end,
-                        )
+                        if self.profile.parser == "tangerine_savings_account":
+                            (
+                                page_rows,
+                                tangerine_current_balance,
+                                page_opening_balance,
+                                page_closing_balance,
+                            ) = self._extract_tangerine_savings_page_transactions(
+                                page,
+                                tangerine_current_balance,
+                                tangerine_statement_start,
+                                tangerine_statement_end,
+                            )
+                        else:
+                            (
+                                page_rows,
+                                tangerine_current_balance,
+                                page_opening_balance,
+                                page_closing_balance,
+                            ) = self._extract_tangerine_chequing_page_transactions(
+                                page,
+                                tangerine_current_balance,
+                                tangerine_statement_start,
+                                tangerine_statement_end,
+                            )
 
                         if page_opening_balance is not None:
                             if (
@@ -4298,7 +4398,7 @@ class VisaPDFProcessor:
                                 != tangerine_opening_balance
                             ):
                                 raise PDFProcessingError(
-                                    "Conflicting Tangerine Chequing opening "
+                                    f"Conflicting {tangerine_label} opening "
                                     "balances were found in the PDF."
                                 )
 
@@ -4685,13 +4785,14 @@ class VisaPDFProcessor:
                 statement_end_date=simplii_statement_end,
             )
 
-        if self.profile.parser == "tangerine_chequing_account":
+        if self.profile.parser in TANGERINE_ACCOUNT_PARSERS:
+            tangerine_label = TANGERINE_ACCOUNT_PARSERS[self.profile.parser]
             if (
                 tangerine_statement_start is None
                 or tangerine_statement_end is None
             ):
                 raise PDFProcessingError(
-                    "Tangerine Chequing statement period was not found. "
+                    f"{tangerine_label} statement period was not found. "
                     "Transaction years cannot be resolved safely."
                 )
 
@@ -4797,6 +4898,12 @@ class VisaPDFProcessor:
             )
         elif self.profile.parser == "tangerine_chequing_account":
             self._validate_tangerine_chequing_balances(
+                tangerine_opening_balance,
+                tangerine_current_balance,
+                tangerine_closing_balance,
+            )
+        elif self.profile.parser == "tangerine_savings_account":
+            self._validate_tangerine_savings_balances(
                 tangerine_opening_balance,
                 tangerine_current_balance,
                 tangerine_closing_balance,
