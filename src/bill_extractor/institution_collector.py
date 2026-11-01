@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .yearly_consolidator import (
-    is_yearly_summary, stage_paired_yearly_transaction_csvs,
+    is_generated_summary, stage_paired_yearly_transaction_csvs,
 )
 
 from collections.abc import Iterable, Sequence
@@ -54,6 +54,7 @@ class AccountCollectionResult:
     combined_transaction_count: int
     duplicate_statement_copies_skipped: int = 0
     yearly_refresh_warnings: tuple[str, ...] = ()
+    original_csv_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -269,7 +270,7 @@ def _normalized_statement_paths(output_root: Path) -> list[Path]:
             for path in output_root.rglob(
                 f"*{_NORMALIZED_SUFFIX}"
             )
-            if path.is_file() and not is_yearly_summary(path)
+            if path.is_file() and not is_generated_summary(path)
         ),
         key=lambda path: str(path).casefold(),
     )
@@ -824,6 +825,7 @@ def _account_manifest_payload(
     slug: str,
     collection_root: Path,
     combined_csv_path: Path,
+    original_csv_path: Path | None = None,
     combined_transaction_count: int,
     duplicate_statement_copies_skipped: int,
     entries: Sequence[_CollectionEntry],
@@ -836,7 +838,7 @@ def _account_manifest_payload(
         "entries": [],
         "managed_artifacts": [
             {
-                "kind": "combined_transactions",
+                "kind": "normalized_transactions",
                 "path": (
                     combined_csv_path
                     .relative_to(collection_root)
@@ -844,7 +846,10 @@ def _account_manifest_payload(
                 ),
                 "transaction_count": combined_transaction_count,
             }
-        ],
+        ] + ([{
+            "kind": "original_transactions",
+            "path": original_csv_path.relative_to(collection_root).as_posix(),
+        }] if original_csv_path is not None else []),
         "profile_display_name": profile.display_name,
         "profile_id": profile.profile_id,
         "source_statements": [
@@ -934,6 +939,7 @@ def _load_previous_manifest(
     manifest_path: Path,
     *,
     expected_combined_artifact_path: Path,
+    additional_artifacts: dict[str, Path] | None = None,
 ) -> dict[str, Path]:
     if not manifest_path.exists():
         return {}
@@ -1003,34 +1009,27 @@ def _load_previous_manifest(
             "Collection manifest is malformed; no files were changed."
         )
 
-    seen_combined_artifact = False
+    allowed_artifacts = {"combined_transactions": expected_combined_artifact_path}
+    allowed_artifacts.update(additional_artifacts or {})
+    seen_artifact_paths: set[Path] = set()
     for item in artifacts:
         if not isinstance(item, dict):
             raise InstitutionCollectionError(
                 "Collection manifest is malformed; no files were changed."
             )
-        if item.get("kind") != "combined_transactions":
+        kind = item.get("kind")
+        expected_path = allowed_artifacts.get(kind) if isinstance(kind, str) else None
+        if (expected_path is None or item.get("path") !=
+                expected_path.relative_to(collection_root).as_posix()):
             raise InstitutionCollectionError(
                 "Collection manifest is malformed; no files were changed."
             )
-        if item.get("path") != expected_combined_relative:
+        destination = _manifest_destination_path(collection_root, item.get("path"))
+        if destination != expected_path.resolve() or destination in seen_artifact_paths:
             raise InstitutionCollectionError(
                 "Collection manifest is malformed; no files were changed."
             )
-        if seen_combined_artifact:
-            raise InstitutionCollectionError(
-                "Collection manifest is malformed; no files were changed."
-            )
-        seen_combined_artifact = True
-
-        destination = _manifest_destination_path(
-            collection_root,
-            item.get("path"),
-        )
-        if destination != expected_combined_artifact_path.resolve():
-            raise InstitutionCollectionError(
-                "Collection manifest is malformed; no files were changed."
-            )
+        seen_artifact_paths.add(destination)
         by_destination[
             destination.as_posix().casefold()
         ] = destination
@@ -1325,8 +1324,9 @@ def collect_profile_account_statement_csvs(
     slug = account_slug(selected_profile)
     combined_csv_path = (
         output_folder
-        / f"{slug}_all_transactions.csv"
+        / f"{slug}_all_normalized_transactions.csv"
     )
+    raw_combined_csv_path = output_folder / f"{slug}_all_transactions.csv"
     manifest_path = (
         output_folder
         / _ACCOUNT_MANIFEST_NAME
@@ -1334,7 +1334,11 @@ def collect_profile_account_statement_csvs(
 
     previous_by_destination = _load_previous_manifest(
         manifest_path,
-        expected_combined_artifact_path=combined_csv_path,
+        expected_combined_artifact_path=raw_combined_csv_path,
+        additional_artifacts={
+            "normalized_transactions": combined_csv_path,
+            "original_transactions": raw_combined_csv_path,
+        },
     )
 
     entries, duplicate_statement_copies_skipped = _account_entries(
@@ -1348,7 +1352,7 @@ def collect_profile_account_statement_csvs(
     _protect_unmanaged_destinations(
         (),
         previous_by_destination,
-        extra_targets=(combined_csv_path,),
+        extra_targets=(combined_csv_path, raw_combined_csv_path),
     )
 
     # Normalized-only collection remains supported. Annual raw exports must
@@ -1381,11 +1385,35 @@ def collect_profile_account_statement_csvs(
 
     staged = {}
     stale_yearly_paths = set()
+    # A pre-upgrade managed *_all_transactions.csv contained normalized rows.
+    # Retire that mislabeled file only when normalized-only collection cannot
+    # replace it with original rows. Already-correct raw exports are retained.
+    preserve_previous_raw = False
+    if yearly_warnings and raw_combined_csv_path.exists():
+        columns = tuple(pd.read_csv(raw_combined_csv_path, nrows=0).columns)
+        normalized_columns = selected_profile.normalized_output_columns or tuple(NORMALIZED_COLUMNS)
+        if columns == tuple(normalized_columns):
+            stale_yearly_paths.add(raw_combined_csv_path)
+        else:
+            preserve_previous_raw = True
+    raw_combined = None
     if not yearly_warnings:
+        if raw_frames:
+            order = pd.concat(yearly_frames, ignore_index=True).sort_values(
+                ["transaction_date", "posting_date", "effective_date",
+                 "source_relative_path", "_row_sequence"], kind="mergesort",
+            ).index
+            raw_combined = pd.concat(raw_frames, ignore_index=True).iloc[order].reset_index(drop=True)
+        else:
+            raw_combined = pd.DataFrame(columns=selected_profile.required_headers)
+        if "profile_name" in raw_combined.columns:
+            raise InstitutionCollectionError("Original columns already contain profile_name.")
+        raw_combined["profile_name"] = selected_profile.display_name
         _, staged, stale_yearly_paths = stage_paired_yearly_transaction_csvs(
             yearly_frames, raw_frames, output_root=output_folder,
             institution_slug=slug,
             output_columns=selected_profile.normalized_output_columns,
+            profile_names={selected_profile.profile_id: selected_profile.display_name},
         )
 
     manifest_payload = _account_manifest_payload(
@@ -1393,6 +1421,8 @@ def collect_profile_account_statement_csvs(
         slug=slug,
         collection_root=output_folder,
         combined_csv_path=combined_csv_path,
+        original_csv_path=(raw_combined_csv_path if raw_combined is not None
+                           or preserve_previous_raw else None),
         combined_transaction_count=len(combined_transactions),
         duplicate_statement_copies_skipped=(
             duplicate_statement_copies_skipped
@@ -1400,6 +1430,10 @@ def collect_profile_account_statement_csvs(
         entries=entries,
     )
     try:
+        if raw_combined is not None:
+            staged[raw_combined_csv_path] = _write_combined_temp(
+                raw_combined, raw_combined_csv_path,
+            )
         staged[combined_csv_path] = _write_combined_temp(
             combined_transactions, combined_csv_path,
         )
@@ -1422,6 +1456,7 @@ def collect_profile_account_statement_csvs(
     )
 
     return AccountCollectionResult(
+        original_csv_path=raw_combined_csv_path if raw_combined is not None else None,
         yearly_refresh_warnings=tuple(yearly_warnings),
         profile_id=selected_profile.profile_id,
         profile_display_name=selected_profile.display_name,

@@ -728,7 +728,7 @@ class GUIWorkflowTest(unittest.TestCase):
             text,
         )
         self.assertIn(
-            "Combined CSV:",
+            "Normalized all-years CSV:",
             text,
         )
 

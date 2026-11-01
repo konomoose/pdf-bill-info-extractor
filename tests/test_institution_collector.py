@@ -279,14 +279,14 @@ class AccountCollectorTest(unittest.TestCase):
                 chequing_result.combined_csv_path,
                 (
                     chequing_root
-                    / "tangerine_chequing_all_transactions.csv"
+                    / "tangerine_chequing_all_normalized_transactions.csv"
                 ).resolve(),
             )
             self.assertEqual(
                 savings_result.combined_csv_path,
                 (
                     savings_root
-                    / "tangerine_savings_all_transactions.csv"
+                    / "tangerine_savings_all_normalized_transactions.csv"
                 ).resolve(),
             )
         self.assertEqual(
@@ -612,7 +612,7 @@ class AccountCollectorTest(unittest.TestCase):
 
             self.assertEqual(
                 result.combined_csv_path,
-                (output_root / "eq_bank_all_transactions.csv").resolve(),
+                (output_root / "eq_bank_all_normalized_transactions.csv").resolve(),
             )
             self.assertEqual(
                 result.output_folder,

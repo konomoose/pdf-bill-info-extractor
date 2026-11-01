@@ -529,6 +529,11 @@ def is_yearly_summary(path: Path) -> bool:
     )) and bool(re.fullmatch(r"\d{4}", path.parent.name))
 
 
+
+def is_generated_summary(path: Path) -> bool:
+    """Exclude generated yearly and all-years exports from monthly scans."""
+    return is_yearly_summary(path) or path.name.endswith("_all_normalized_transactions.csv")
+
 def write_paired_yearly_transaction_csvs(
     frames: Iterable[pd.DataFrame],
     raw_frames: Iterable[pd.DataFrame],
@@ -536,6 +541,7 @@ def write_paired_yearly_transaction_csvs(
     output_root: str | Path,
     institution_slug: str,
     output_columns: tuple[str, ...] | None = None,
+    profile_names: dict[str, str] | None = None,
 ) -> dict[int, Path]:
     """Write aligned original-column and normalized calendar-year CSVs.
 
@@ -547,6 +553,7 @@ def write_paired_yearly_transaction_csvs(
     targets, staged, stale_paths = stage_paired_yearly_transaction_csvs(
         frames, raw_frames, output_root=output_root,
         institution_slug=institution_slug, output_columns=output_columns,
+        profile_names=profile_names,
     )
     try:
         _commit_yearly_outputs(staged, stale_paths)
@@ -563,6 +570,7 @@ def stage_paired_yearly_transaction_csvs(
     output_root: str | Path,
     institution_slug: str,
     output_columns: tuple[str, ...] | None = None,
+    profile_names: dict[str, str] | None = None,
 ) -> tuple[dict[int, Path], dict[Path, Path], set[Path]]:
     """Validate and stage both yearly formats without replacing existing files.
 
@@ -608,6 +616,13 @@ def stage_paired_yearly_transaction_csvs(
         if prepared:
             combined = pd.concat(prepared, ignore_index=True)
             raw_combined = pd.concat(originals, ignore_index=True)
+            if profile_names is not None:
+                if "profile_name" in raw_combined.columns:
+                    raise ConsolidationError("Original columns already contain profile_name.")
+                names = combined["profile_id"].map(profile_names)
+                if names.isna().any() or names.eq("").any():
+                    raise ConsolidationError("A transaction has no matching profile name.")
+                raw_combined["profile_name"] = names
             combined = combined.drop_duplicates(
                 subset=[*EXACT_DUPLICATE_COLUMNS, "_row_occurrence"], keep="first"
             ).sort_values(

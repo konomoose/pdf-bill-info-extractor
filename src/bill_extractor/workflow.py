@@ -28,7 +28,7 @@ from .yearly_consolidator import (
     ConsolidationError,
     consolidate_normalized_transactions,
     write_paired_yearly_transaction_csvs,
-    is_yearly_summary,
+    is_generated_summary,
 )
 
 
@@ -268,7 +268,7 @@ def _load_normalized_statement_frames(
         ),
         key=lambda path: str(path).casefold(),
     ):
-        if is_yearly_summary(csv_path):
+        if is_generated_summary(csv_path):
             continue
         frame = pd.read_csv(
             csv_path,
@@ -455,7 +455,7 @@ def _remove_stale_statement_outputs(
         ),
         key=lambda path: str(path).casefold(),
     ):
-        if is_yearly_summary(normalized_csv):
+        if is_generated_summary(normalized_csv):
             continue
         if normalized_csv.resolve() in protected:
             continue
@@ -1182,6 +1182,7 @@ def run_extraction_workflow(
                     output_root=output_root,
                     institution_slug=slug,
                     output_columns=yearly_output_columns,
+                    profile_names={p.profile_id: p.display_name for p in output_profiles},
                 )
             )
         except (

@@ -374,8 +374,8 @@ class TangerineSavingsProfileTest(unittest.TestCase):
                 output_root / "2026" / "statement_transactions.csv",
                 dtype=str, keep_default_na=False,
             )
-            self.assertEqual(list(raw_yearly.columns), list(profile.required_headers))
-            pd.testing.assert_frame_equal(raw_yearly, raw_statement)
+            self.assertEqual(list(raw_yearly.columns), [*profile.required_headers, "profile_name"])
+            pd.testing.assert_frame_equal(raw_yearly, raw_statement.assign(profile_name=profile.display_name))
 
         self.assertEqual(
             list(statement.columns),

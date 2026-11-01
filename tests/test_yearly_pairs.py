@@ -39,9 +39,16 @@ class YearlyPairs(unittest.TestCase):
                     result=collect_profile_account_statement_csvs(profile)
                     self.assertEqual(result.combined_transaction_count,3)
                     self.assertEqual(len(_normalized_statement_paths(root)),1)
+                    self.assertEqual(result.combined_csv_path.name, 'account_all_normalized_transactions.csv')
+                    self.assertEqual(result.original_csv_path.name, 'account_all_transactions.csv')
+                    original_all = pd.read_csv(result.original_csv_path, dtype=str, keep_default_na=False)
+                    pd.testing.assert_frame_equal(
+                        original_all,
+                        raw.iloc[[1, 0, 2]].reset_index(drop=True).assign(profile_name=profile.display_name),
+                    )
                     for year, indices in [(2022,[1]),(2023,[0,2])]:
                         actual=pd.read_csv(root/str(year)/f'account_{year}_transactions.csv',dtype=str,keep_default_na=False)
-                        pd.testing.assert_frame_equal(actual,raw.iloc[indices].reset_index(drop=True))
+                        pd.testing.assert_frame_equal(actual,raw.iloc[indices].reset_index(drop=True).assign(profile_name=profile.display_name))
                         norm=pd.read_csv(root/str(year)/f'account_{year}_normalized_transactions.csv',dtype=str,keep_default_na=False)
                         self.assertEqual(list(norm.columns),list(columns))
                         self.assertEqual(norm['transaction_date'].tolist(),normal.iloc[indices]['transaction_date'].tolist())

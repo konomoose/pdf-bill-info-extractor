@@ -55,13 +55,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_WINDOW_WIDTH = 980
-DEFAULT_WINDOW_HEIGHT = 900
+DEFAULT_WINDOW_HEIGHT = 980
 WINDOW_SCREEN_MARGIN_WIDTH = 80
 WINDOW_SCREEN_MARGIN_HEIGHT = 100
 MIN_WINDOW_WIDTH = 760
 MIN_WINDOW_HEIGHT = 520
-RESULTS_PANE_MIN_HEIGHT = 180
-RESULTS_TEXT_MIN_LINES = 10
+RESULTS_PANE_MIN_HEIGHT = 120
+RESULTS_TEXT_MIN_LINES = 5
 
 
 def initial_window_geometry(
@@ -220,13 +220,18 @@ def account_collection_result_messages(
             "Duplicate statement copies skipped: "
             f"{result.duplicate_statement_copies_skipped}"
         ),
-        f"Combined CSV: {result.combined_csv_path}",
+        f"Normalized all-years CSV: {result.combined_csv_path}",
     ]
 
+    if result.original_csv_path is not None:
+        messages.extend([
+            f"Original-column all-years CSV: {result.original_csv_path}",
+            "Original-column all-years and yearly CSVs include profile_name as the last column.",
+        ])
     if result.yearly_refresh_warnings:
         messages.extend([
-            "WARNING: yearly CSV pairs were NOT refreshed; existing yearly files were left unchanged.",
-            "The all-years CSV above was rebuilt from normalized monthly CSVs.",
+            "WARNING: original all-years CSV and yearly CSV pairs were NOT refreshed; previous original/yearly exports may be out of date.",
+            "The normalized all-years CSV above was rebuilt from normalized monthly CSVs.",
             "Re-extract the listed statements to restore their original/normalized pairs, then collect again.",
             *result.yearly_refresh_warnings,
         ])
@@ -460,6 +465,9 @@ class PDFBillExtractorApp:
             orient=tk.VERTICAL,
         )
         self.main_paned.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self._pane_layout_job = None
+        self._controls_requested_height = None
+        self.main_paned.bind("<Configure>", self._schedule_pane_layout)
 
         self.controls_scroll_container = ttk.Frame(self.main_paned)
         self.controls_scroll_container.columnconfigure(0, weight=1)
@@ -917,7 +925,7 @@ class PDFBillExtractorApp:
             self.results_frame,
             weight=1,
         )
-        self.root.after_idle(self._set_initial_pane_sizes)
+        self._schedule_pane_layout()
 
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(
@@ -934,6 +942,11 @@ class PDFBillExtractorApp:
         self.controls_canvas.configure(
             scrollregion=self.controls_canvas.bbox("all"),
         )
+        requested_height = self.controls_frame.winfo_reqheight()
+        if requested_height != self._controls_requested_height:
+            self._controls_requested_height = requested_height
+            self._schedule_pane_layout()
+        self._update_controls_scrollbar()
 
     def _controls_canvas_configured(
         self,
@@ -943,22 +956,34 @@ class PDFBillExtractorApp:
             self.controls_frame_window,
             width=event.width,
         )
+        self._update_controls_scrollbar()
+
+    def _update_controls_scrollbar(self) -> None:
+        if self.controls_frame.winfo_reqheight() > self.controls_canvas.winfo_height():
+            self.controls_scrollbar.grid()
+        else:
+            self.controls_scrollbar.grid_remove()
+            self.controls_canvas.yview_moveto(0)
+
+    def _schedule_pane_layout(self, _event: object | None = None) -> None:
+        if self._pane_layout_job is None:
+            self._pane_layout_job = self.root.after_idle(self._set_initial_pane_sizes)
 
     def _set_initial_pane_sizes(self) -> None:
+        self._pane_layout_job = None
         height = self.main_paned.winfo_height()
         if height <= RESULTS_PANE_MIN_HEIGHT:
             return
 
-        results_height = min(
-            360,
-            max(
-                RESULTS_PANE_MIN_HEIGHT,
-                height // 3,
-            ),
-        )
+        # Keep the complete controls visible whenever they fit. Reserve a
+        # compact results viewport; its own scrollbar handles long logs.
+        # Only small windows need the controls' fallback scrollbar.
         sash_position = max(
             120,
-            height - results_height,
+            min(
+                self.controls_frame.winfo_reqheight(),
+                height - RESULTS_PANE_MIN_HEIGHT - 8,
+            ),
         )
 
         try:
@@ -1657,13 +1682,15 @@ class PDFBillExtractorApp:
             f"{result.combined_transaction_count}\n"
             "Duplicate statement copies skipped: "
             f"{result.duplicate_statement_copies_skipped}\n"
-            f"Combined CSV: {result.combined_csv_path}\n"
+            f"Normalized all-years CSV: {result.combined_csv_path}\n"
             "Source: this selected profile's configured output folder\n"
             f"Output folder: {result.output_folder}"
         )
 
+        if result.original_csv_path is not None:
+            completion_message += f"\nOriginal-column all-years CSV: {result.original_csv_path}"
         if result.yearly_refresh_warnings:
-            completion_message += "\n\nYearly CSV pairs were NOT refreshed. See the results pane for details."
+            completion_message += "\n\nOriginal all-years and yearly CSV exports were NOT refreshed. See the results pane for details."
         notify = messagebox.showwarning if result.yearly_refresh_warnings else messagebox.showinfo
         notify(
             "Account Collection Complete",
