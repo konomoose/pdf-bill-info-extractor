@@ -8,6 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from src.bill_extractor.analysis_summary import (
+    build_analysis, saved_selection,
+)
 from src.bill_extractor.pdf_processor import (
     PDFProcessingError,
 )
@@ -163,7 +166,7 @@ def workflow_result_messages(
             messages.append(
                 f"{yearly.year}: "
                 f"{yearly.transaction_count} transactions | "
-                f"{yearly.csv_path}"
+                f"Original: {yearly.csv_path} | Normalized: {yearly.normalized_csv_path}"
             )
     else:
         messages.append(
@@ -196,7 +199,7 @@ def account_collection_result_messages(
     result: AccountCollectionResult,
 ) -> list[str]:
     """Build privacy-safe GUI messages for account collection."""
-    return [
+    messages = [
         "",
         "ACCOUNT COLLECTION RESULTS",
         f"Profile/account: {result.profile_display_name}",
@@ -219,6 +222,17 @@ def account_collection_result_messages(
         ),
         f"Combined CSV: {result.combined_csv_path}",
     ]
+
+    if result.yearly_refresh_warnings:
+        messages.extend([
+            "WARNING: yearly CSV pairs were NOT refreshed; existing yearly files were left unchanged.",
+            "The all-years CSV above was rebuilt from normalized monthly CSVs.",
+            "Re-extract the listed statements to restore their original/normalized pairs, then collect again.",
+            *result.yearly_refresh_warnings,
+        ])
+    else:
+        messages.append("Yearly original-column and normalized CSVs refreshed from current statements.")
+    return messages
 
 
 def pdf_preparation_result_messages(
@@ -249,6 +263,20 @@ def pdf_preparation_result_messages(
         f"Redacted folder: {result.redacted_folder}",
         "Review the redacted PDFs before sharing them.",
     ]
+
+    messages.extend([
+        "",
+        "Skipped security removal = existing prepared copy verified against source.",
+        "Redaction counts cover only PDFs that passed preparation.",
+    ])
+    if result.security_failed_count or result.security_password_required_count:
+        messages.append("ACTION REQUIRED: review preparation failures before relying on complete transaction totals.")
+    if result.security_failure_messages:
+        messages.extend(["", "Preparation failure details:", *result.security_failure_messages])
+    if result.report_path:
+        messages.append(f"Preparation report: {result.report_path}")
+    if result.report_error:
+        messages.append(f"Could not save preparation report: {result.report_error}")
 
     if result.security_password_required_count:
         messages.extend(
@@ -415,6 +443,7 @@ class PDFBillExtractorApp:
             self.active_profile,
             clear_results=False,
         )
+        self.profile_var.trace_add("write", lambda *_: self._profile_selected())
 
     def setup_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -824,6 +853,17 @@ class PDFBillExtractorApp:
             column=1,
         )
 
+        self.analysis_btn = ttk.Button(
+            button_frame, text="Build Profile All-Years Summary",
+            command=lambda: self._start_analysis((self.active_profile,), False),
+        )
+        self.analysis_btn.grid(row=1, column=0, padx=(0, 10), pady=(8, 0))
+        self.overall_btn = ttk.Button(
+            button_frame, text="Select Profiles / Build Overall Summary",
+            command=self._choose_analysis_profiles,
+        )
+        self.overall_btn.grid(row=1, column=1, pady=(8, 0))
+
         self.folder_mode_info_var = tk.StringVar()
         ttk.Label(
             main_frame,
@@ -1002,6 +1042,12 @@ class PDFBillExtractorApp:
         self,
         _event: object | None = None,
     ) -> None:
+        key = self.preparation_account_var.get().strip().replace("\\", "/")
+        matches = [p for p in self.profiles if profile_preparation_account_key(p) == key]
+        if len(matches) == 1 and matches[0] != self.active_profile:
+            self.profile_var.set(matches[0].display_name)
+            self._apply_profile(matches[0], clear_results=True)
+            return
         self.clear_results()
         self._update_preparation_paths()
         self._load_redaction_terms_for_preparation_account()
@@ -1331,6 +1377,71 @@ class PDFBillExtractorApp:
         )
         worker.start()
 
+    def _choose_analysis_profiles(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Choose profiles for overall summary")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text=(
+            "Select every profile to include. The summary will be rebuilt from "
+            "their normalized yearly files.\nExisting exports stay unchanged; "
+            "repeated clicks do not append transactions."
+        ), wraplength=620).pack(anchor=tk.W, pady=(0, 10))
+        remembered = saved_selection() or {self.active_profile.profile_id}
+        choices = []
+        for profile in self.profiles:
+            selected = tk.BooleanVar(value=profile.profile_id in remembered)
+            ttk.Checkbutton(body, text=profile.display_name, variable=selected).pack(anchor=tk.W)
+            choices.append((profile, selected))
+        ttk.Label(body, text=(
+            "Money in/out includes transfers, card payments and loan activity. "
+            "These totals are not income/expense totals. Balances are retained "
+            "per transaction, not added together."
+        ), wraplength=620).pack(anchor=tk.W, pady=12)
+        actions = ttk.Frame(body)
+        actions.pack(fill=tk.X)
+        def build():
+            profiles = tuple(p for p, variable in choices if variable.get())
+            if not profiles:
+                messagebox.showinfo("Choose profiles", "Select at least one profile.", parent=dialog)
+                return
+            dialog.destroy()
+            self._start_analysis(profiles, True)
+        ttk.Button(actions, text="Build Overall Summary", command=build).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
+
+    def _start_analysis(self, profiles, overall: bool) -> None:
+        self._set_buttons_state(tk.DISABLED)
+        self.progress.start(10)
+        self.status_var.set("Building analysis summary...")
+        self._append_operation_header("ANALYSIS SUMMARY", tuple(p.display_name for p in profiles))
+        self._append_result("Reading normalized yearly CSVs from configured profile output folders.\n")
+        def worker():
+            try:
+                result = build_analysis(profiles, overall=overall)
+                self.root.after(0, self._analysis_succeeded, result)
+            except Exception as exc:
+                self.root.after(0, self._processing_failed, str(exc))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _analysis_succeeded(self, result) -> None:
+        self.progress.stop()
+        self._set_buttons_state(tk.NORMAL)
+        self.status_var.set(f"Analysis ready: {result.transaction_count} transactions")
+        details = (
+            f"Profiles: {result.profile_count} | Yearly files: {result.yearly_file_count}\n"
+            f"Transactions: {result.transaction_count}\n"
+            f"Money in: {result.money_in} | Money out: {result.money_out}\n"
+            f"Net amount: {result.net_amount}\n"
+            f"CSV: {result.csv_path}\n"
+            "Separate monthly/yearly analysis copies use the same headers.\n"
+            "Totals include transfers, card payments and loan activity."
+        )
+        self._append_result(details + "\n")
+        messagebox.showinfo("Analysis summary ready", details)
+
     def start_collection(self) -> None:
         profile = self.active_profile
 
@@ -1551,7 +1662,10 @@ class PDFBillExtractorApp:
             f"Output folder: {result.output_folder}"
         )
 
-        messagebox.showinfo(
+        if result.yearly_refresh_warnings:
+            completion_message += "\n\nYearly CSV pairs were NOT refreshed. See the results pane for details."
+        notify = messagebox.showwarning if result.yearly_refresh_warnings else messagebox.showinfo
+        notify(
             "Account Collection Complete",
             completion_message,
         )
@@ -1638,6 +1752,8 @@ class PDFBillExtractorApp:
         self.prepare_btn.config(state=state)
         self.process_btn.config(state=state)
         self.collect_btn.config(state=state)
+        self.analysis_btn.config(state=state)
+        self.overall_btn.config(state=state)
 
     def _append_result(self, text: str) -> None:
         self.results_text.insert(tk.END, text)

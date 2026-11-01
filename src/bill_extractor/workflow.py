@@ -27,7 +27,8 @@ from .transaction_normalizer import (
 from .yearly_consolidator import (
     ConsolidationError,
     consolidate_normalized_transactions,
-    write_yearly_transaction_csvs,
+    write_paired_yearly_transaction_csvs,
+    is_yearly_summary,
 )
 
 
@@ -55,6 +56,12 @@ class YearlyOutput:
     year: int
     csv_path: Path
     transaction_count: int
+
+    @property
+    def normalized_csv_path(self) -> Path:
+        return self.csv_path.with_name(
+            self.csv_path.name.replace("_transactions.csv", "_normalized_transactions.csv")
+        )
 
 
 @dataclass(frozen=True)
@@ -261,6 +268,8 @@ def _load_normalized_statement_frames(
         ),
         key=lambda path: str(path).casefold(),
     ):
+        if is_yearly_summary(csv_path):
+            continue
         frame = pd.read_csv(
             csv_path,
             dtype=str,
@@ -276,6 +285,7 @@ def _load_normalized_statement_frames(
                     profiles,
                 )
             )
+            frames[-1].attrs["raw_csv_path"] = str(_raw_csv_for_normalized(csv_path))
 
     return frames
 
@@ -445,6 +455,8 @@ def _remove_stale_statement_outputs(
         ),
         key=lambda path: str(path).casefold(),
     ):
+        if is_yearly_summary(normalized_csv):
+            continue
         if normalized_csv.resolve() in protected:
             continue
 
@@ -1163,8 +1175,10 @@ def run_extraction_workflow(
                 )
             )
             written = (
-                write_yearly_transaction_csvs(
+                write_paired_yearly_transaction_csvs(
                     frames,
+                    [pd.read_csv(f.attrs["raw_csv_path"], dtype=str,
+                                 keep_default_na=False) for f in frames],
                     output_root=output_root,
                     institution_slug=slug,
                     output_columns=yearly_output_columns,

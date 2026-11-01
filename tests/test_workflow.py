@@ -514,7 +514,7 @@ class WorkflowTest(unittest.TestCase):
                 / "2025"
                 / (
                     "test_bank_2025_"
-                    "transactions.csv"
+                    "normalized_transactions.csv"
                 )
             )
 

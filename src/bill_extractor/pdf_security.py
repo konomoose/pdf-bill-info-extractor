@@ -169,29 +169,27 @@ def output_path_for(
     return output_root / source.relative_to(source_root)
 
 
-def verify_existing_output(
+def check_existing_output(
     source: Path,
     destination: Path,
     *,
     password: str | None,
-) -> bool:
+) -> None:
+    """Raise the actual verification reason without exposing statement text."""
+    with fitz.open(source) as source_document:
+        authenticate_document(source_document, password)
+        source_states = inspect_document(source_document)
+    with fitz.open(destination) as output_document:
+        if output_document.needs_pass or output_document.is_encrypted:
+            raise PDFSecurityError("Existing prepared PDF is still encrypted.")
+        output_states = inspect_document(output_document)
+    verify_text_preserved(source_states, output_states)
+
+
+def verify_existing_output(source: Path, destination: Path, *, password: str | None) -> bool:
     try:
-        with fitz.open(source) as source_document:
-            authenticate_document(source_document, password)
-            source_states = inspect_document(source_document)
-
-        with fitz.open(destination) as output_document:
-            if (
-                output_document.needs_pass
-                or output_document.is_encrypted
-            ):
-                return False
-
-            output_states = inspect_document(output_document)
-
-        verify_text_preserved(source_states, output_states)
+        check_existing_output(source, destination, password=password)
         return True
-
     except Exception:
         return False
 
@@ -220,21 +218,25 @@ def remove_pdf_security(
     )
 
     if destination.exists() and not force:
-        if verify_existing_output(
-            source,
-            destination,
-            password=password,
-        ):
-            return PDFSecurityResult(
-                source=source,
-                destination=destination,
-                status="skipped",
-                message="Verified unsecured output already exists.",
-            )
-
-        raise PDFSecurityError(
-            f"Output exists but could not be verified against source: "
-            f"{destination}. Use force only after reviewing it."
+        try:
+            check_existing_output(source, destination, password=password)
+        except PDFPasswordRequiredError:
+            raise
+        except Exception as exc:
+            if isinstance(exc, PDFSecurityError):
+                reason = str(exc)
+            elif isinstance(exc, OSError):
+                reason = f"{type(exc).__name__}: {exc.strerror or 'File access failed'}"
+            else:
+                reason = f"{type(exc).__name__} while opening or inspecting the PDFs."
+            raise PDFSecurityError(
+                f"Output exists but could not be verified against source: {destination}. "
+                f"Reason: {reason} Back up the existing prepared copy outside "
+                "editable_input, then run Prepare PDFs again to regenerate it."
+            ) from exc
+        return PDFSecurityResult(
+            source=source, destination=destination, status="skipped",
+            message="Verified unsecured output already exists.",
         )
 
     temporary = destination.with_name(

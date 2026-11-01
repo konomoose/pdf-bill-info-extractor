@@ -227,7 +227,7 @@ class SelectedWorkflowTest(
                 / "2025"
                 / (
                     "selected_bank_2025_"
-                    "transactions.csv"
+                    "normalized_transactions.csv"
                 )
             )
 

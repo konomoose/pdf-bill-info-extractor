@@ -1633,6 +1633,33 @@ class VisaPDFProcessor:
                 word for nearby_line in nearby_lines for word in nearby_line["words"]
             ]
             nearby_text = " ".join(word[4] for word in nearby_words).lower()
+            # Earlier statements print one date column on a single header line.
+            # Keep the CSV schema stable; no effective date is supplied by them.
+            legacy_date = next(
+                (word for word in line_words if word[4].lower() == "date"), None
+            )
+            if legacy_date is not None and not any(
+                word[4].lower() in ("trans.", "eff.") for word in nearby_words
+            ):
+                labels = {
+                    label: next((w for w in line_words if w[4].lower() == label), None)
+                    for label in ("transaction", "balance")
+                }
+                funds = sorted(
+                    (w for w in line_words if w[4].lower() == "funds"),
+                    key=lambda w: w[0],
+                )
+                if all(labels.values()) and len(funds) == 2:
+                    positions = [legacy_date[0], labels["transaction"][0],
+                                 funds[0][0], funds[1][0], labels["balance"][0]]
+                    if positions == sorted(positions):
+                        return {
+                            "trans": positions[0], "eff": positions[1],
+                            "transaction": positions[1], "funds_out": positions[2],
+                            "funds_in": positions[3], "balance": positions[4],
+                            "bottom": max(w[3] for w in line_words),
+                            "single_date": True,
+                        }
             if not all(token in nearby_text for token in ("trans.", "eff.", "date")):
                 continue
 
@@ -1774,10 +1801,14 @@ class VisaPDFProcessor:
             funds_out_valid = bool(AMOUNT_RE.fullmatch(cells["funds_out"]))
             funds_in_valid = bool(AMOUNT_RE.fullmatch(cells["funds_in"]))
             balance_valid = bool(SIMPLII_BALANCE_RE.fullmatch(cells["balance"]))
+            effective_date_valid = bool(
+                DATE_RE.fullmatch(cells["eff"])
+                or (header.get("single_date") and not cells["eff"])
+            )
 
             is_transaction = bool(
                 DATE_RE.fullmatch(cells["trans"])
-                and DATE_RE.fullmatch(cells["eff"])
+                and effective_date_valid
                 and cells["transaction"]
                 and balance_valid
                 and (funds_out_valid ^ funds_in_valid)
@@ -1808,7 +1839,7 @@ class VisaPDFProcessor:
             # BALANCE FORWARD has dates and a balance but no funds in/out.
             if (
                 DATE_RE.fullmatch(cells["trans"])
-                and DATE_RE.fullmatch(cells["eff"])
+                and effective_date_valid
                 and cells["transaction"].upper() == "BALANCE FORWARD"
             ):
                 table_started = True

@@ -352,7 +352,7 @@ class TangerineSavingsProfileTest(unittest.TestCase):
             yearly_csv = (
                 output_root
                 / "2026"
-                / "tangerine_savings_2026_transactions.csv"
+                / "tangerine_savings_2026_normalized_transactions.csv"
             )
 
             statement = pd.read_csv(
@@ -365,6 +365,17 @@ class TangerineSavingsProfileTest(unittest.TestCase):
                 dtype=str,
                 keep_default_na=False,
             )
+
+            raw_yearly = pd.read_csv(
+                output_root / "2026" / "tangerine_savings_2026_transactions.csv",
+                dtype=str, keep_default_na=False,
+            )
+            raw_statement = pd.read_csv(
+                output_root / "2026" / "statement_transactions.csv",
+                dtype=str, keep_default_na=False,
+            )
+            self.assertEqual(list(raw_yearly.columns), list(profile.required_headers))
+            pd.testing.assert_frame_equal(raw_yearly, raw_statement)
 
         self.assertEqual(
             list(statement.columns),

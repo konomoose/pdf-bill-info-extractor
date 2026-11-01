@@ -512,3 +512,124 @@ def write_yearly_transaction_csvs(
     )
 
     return targets
+
+
+def is_yearly_summary(path: Path) -> bool:
+    """Recognize generated year summaries, never as monthly inputs."""
+    return bool(re.fullmatch(
+        r".+_" + re.escape(path.parent.name)
+        + r"_(?:normalized_)?transactions\.csv", path.name
+    )) and bool(re.fullmatch(r"\d{4}", path.parent.name))
+
+
+def write_paired_yearly_transaction_csvs(
+    frames: Iterable[pd.DataFrame],
+    raw_frames: Iterable[pd.DataFrame],
+    *,
+    output_root: str | Path,
+    institution_slug: str,
+    output_columns: tuple[str, ...] | None = None,
+) -> dict[int, Path]:
+    """Write aligned original-column and normalized calendar-year CSVs.
+
+    Raw values are copied verbatim. Resolved normalized dates determine the
+    year and ordering, including statements spanning December and January.
+    Both formats share the existing exact-duplicate rule and commit together.
+    """
+    targets, staged, stale_paths = stage_paired_yearly_transaction_csvs(
+        frames, raw_frames, output_root=output_root,
+        institution_slug=institution_slug, output_columns=output_columns,
+    )
+    try:
+        _commit_yearly_outputs(staged, stale_paths)
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+    return targets
+
+
+def stage_paired_yearly_transaction_csvs(
+    frames: Iterable[pd.DataFrame],
+    raw_frames: Iterable[pd.DataFrame],
+    *,
+    output_root: str | Path,
+    institution_slug: str,
+    output_columns: tuple[str, ...] | None = None,
+) -> tuple[dict[int, Path], dict[Path, Path], set[Path]]:
+    """Validate and stage both yearly formats without replacing existing files.
+
+    The caller must commit the staged paths and stale removals together, and
+    remove temporary files on failure.
+    """
+    if not _INSTITUTION_SLUG_RE.fullmatch(institution_slug):
+        raise ConsolidationError("Invalid institution slug.")
+    frames, raw_frames = list(frames), list(raw_frames)
+    if len(frames) != len(raw_frames):
+        raise ConsolidationError("Missing original/normalized statement pair.")
+    if output_columns is not None and (
+        len(set(output_columns)) != len(output_columns)
+        or any(c not in NORMALIZED_COLUMNS for c in output_columns)
+    ):
+        raise ConsolidationError("Invalid normalized output columns.")
+    prepared, originals = [], []
+    sequence = 0
+    raw_columns = None
+    for number, (frame, raw) in enumerate(zip(frames, raw_frames), 1):
+        if len(frame) != len(raw):
+            raise ConsolidationError(
+                "Original and normalized row counts differ for statement "
+                f"{number}; re-extract that statement before combining."
+            )
+        if raw_columns is None:
+            raw_columns = tuple(raw.columns)
+        elif tuple(raw.columns) != raw_columns:
+            raise ConsolidationError(
+                "Original statement columns differ; combine each account "
+                "profile separately."
+            )
+        item = _prepare_normalized_frame(
+            frame, frame_number=number, starting_sequence=sequence
+        )
+        sequence += len(item)
+        if not item.empty:
+            prepared.append(item)
+            originals.append(raw.reset_index(drop=True))
+    root = Path(output_root)
+    staged, targets = {}, {}
+    try:
+        if prepared:
+            combined = pd.concat(prepared, ignore_index=True)
+            raw_combined = pd.concat(originals, ignore_index=True)
+            combined = combined.drop_duplicates(
+                subset=list(EXACT_DUPLICATE_COLUMNS), keep="first"
+            ).sort_values(
+                ["_transaction_sort", "_posting_sort", "_effective_sort",
+                 "source_file", "_sequence"],
+                kind="mergesort", na_position="last",
+            )
+            for year, group in combined.groupby(combined["_transaction_sort"].dt.year):
+                year = int(year)
+                target = root / str(year) / f"{institution_slug}_{year}_transactions.csv"
+                normalized_target = target.with_name(
+                    f"{institution_slug}_{year}_normalized_transactions.csv"
+                )
+                targets[year] = target
+                staged[target] = _stage_yearly_csv(
+                    raw_combined.iloc[group["_sequence"].tolist()], target
+                )
+                staged[normalized_target] = _stage_yearly_csv(
+                    group.loc[:, list(NORMALIZED_COLUMNS)], normalized_target,
+                    output_columns,
+                )
+        managed = _managed_yearly_csv_paths(root, institution_slug)
+        managed |= {
+            path for path in root.glob(
+                f"????/{institution_slug}_????_normalized_transactions.csv"
+            ) if is_yearly_summary(path)
+        }
+        stale_paths = managed - set(staged)
+    except Exception:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+        raise
+    return targets, staged, stale_paths

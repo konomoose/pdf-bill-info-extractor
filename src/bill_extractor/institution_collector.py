@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from .yearly_consolidator import (
+    is_yearly_summary, stage_paired_yearly_transaction_csvs,
+)
+
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -49,6 +53,7 @@ class AccountCollectionResult:
     collected_count: int
     combined_transaction_count: int
     duplicate_statement_copies_skipped: int = 0
+    yearly_refresh_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -264,7 +269,7 @@ def _normalized_statement_paths(output_root: Path) -> list[Path]:
             for path in output_root.rglob(
                 f"*{_NORMALIZED_SUFFIX}"
             )
-            if path.is_file()
+            if path.is_file() and not is_yearly_summary(path)
         ),
         key=lambda path: str(path).casefold(),
     )
@@ -1346,6 +1351,43 @@ def collect_profile_account_statement_csvs(
         extra_targets=(combined_csv_path,),
     )
 
+    # Normalized-only collection remains supported. Annual raw exports must
+    # never be fabricated from normalized values or built from a partial set.
+    yearly_frames = [_read_normalized_source(entry) for entry in entries]
+    raw_frames = []
+    yearly_warnings = []
+    for entry, normalized in zip(entries, yearly_frames):
+        raw_path = entry.source_path.with_name(entry.source_path.name.replace(
+            "_normalized_transactions.csv", "_transactions.csv"
+        ))
+        reason = None
+        if not raw_path.is_file():
+            reason = "original statement CSV is missing"
+        else:
+            try:
+                raw = pd.read_csv(raw_path, dtype=str, keep_default_na=False)
+            except (OSError, ValueError, pd.errors.ParserError) as exc:
+                reason = f"original statement CSV could not be read ({type(exc).__name__})"
+            else:
+                if tuple(raw.columns) != selected_profile.required_headers:
+                    reason = "original statement CSV has unexpected columns"
+                elif len(raw) != len(normalized):
+                    reason = "original and normalized row counts differ"
+                else:
+                    raw_frames.append(raw)
+        if reason:
+            relative = raw_path.relative_to(output_folder).as_posix()
+            yearly_warnings.append(f"{relative} | {reason}")
+
+    staged = {}
+    stale_yearly_paths = set()
+    if not yearly_warnings:
+        _, staged, stale_yearly_paths = stage_paired_yearly_transaction_csvs(
+            yearly_frames, raw_frames, output_root=output_folder,
+            institution_slug=slug,
+            output_columns=selected_profile.normalized_output_columns,
+        )
+
     manifest_payload = _account_manifest_payload(
         profile=selected_profile,
         slug=slug,
@@ -1357,14 +1399,10 @@ def collect_profile_account_statement_csvs(
         ),
         entries=entries,
     )
-    staged = {
-        combined_csv_path: _write_combined_temp(
-            combined_transactions,
-            combined_csv_path,
-        )
-    }
-
     try:
+        staged[combined_csv_path] = _write_combined_temp(
+            combined_transactions, combined_csv_path,
+        )
         manifest_temp = _write_manifest_temp(
             manifest_path,
             manifest_payload,
@@ -1380,10 +1418,11 @@ def collect_profile_account_statement_csvs(
         staged=staged,
         manifest_path=manifest_path,
         manifest_temp=manifest_temp,
-        stale_paths=set(),
+        stale_paths=stale_yearly_paths,
     )
 
     return AccountCollectionResult(
+        yearly_refresh_warnings=tuple(yearly_warnings),
         profile_id=selected_profile.profile_id,
         profile_display_name=selected_profile.display_name,
         account_slug=slug,

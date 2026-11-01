@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+from datetime import datetime
+from tempfile import NamedTemporaryFile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +54,9 @@ class PDFPreparationResult:
     redaction_skipped_count: int
     redaction_failed_count: int
     redaction_failure_messages: tuple[str, ...] = ()
+    security_failure_messages: tuple[str, ...] = ()
+    report_path: Path | None = None
+    report_error: str | None = None
 
 
 def _project_root(
@@ -241,7 +247,27 @@ def prepare_account_pdfs(
     redaction_failed = 0
     redaction_failure_messages: set[str] = set()
 
+    security_failure_messages: list[str] = []
+    report_rows: list[dict[str, str]] = []
+
+    def error_reason(exc: Exception) -> str:
+        if isinstance(exc, (PDFSecurityError, PDFRedactionError)):
+            reason = str(exc)
+        elif isinstance(exc, OSError):
+            reason = f"{type(exc).__name__}: {exc.strerror or 'File access failed'}"
+        else:
+            reason = f"Unexpected {type(exc).__name__} while processing this PDF."
+        # Do not put passwords or supplied redaction terms in the report.
+        for secret in (password, *normalized_terms):
+            if secret:
+                reason = reason.replace(secret, '[REDACTED]')
+        return reason
+
     for source_pdf in source_pdfs:
+        relative = source_pdf.relative_to(folders.source_folder).as_posix()
+        row = dict(source_pdf=relative, security_status='', security_reason='',
+                   redaction_status='not_attempted', redaction_reason='Preparation did not succeed.')
+        report_rows.append(row)
         try:
             security_result = remove_pdf_security(
                 source_pdf,
@@ -251,13 +277,21 @@ def prepare_account_pdfs(
                 force=force,
             )
 
-        except PDFPasswordRequiredError:
+        except PDFPasswordRequiredError as exc:
             security_password_required += 1
+            row.update(security_status='password_required', security_reason=error_reason(exc))
+            security_failure_messages.append(f"{relative} | Password required: {row['security_reason']}")
             continue
 
-        except Exception:
+        except Exception as exc:
             security_failed += 1
+            row.update(security_status='failed', security_reason=error_reason(exc))
+            security_failure_messages.append(f"{relative} | {row['security_reason']}")
             continue
+
+        row.update(security_status=security_result.status,
+                   security_reason=security_result.message,
+                   redaction_status='', redaction_reason='')
 
         if security_result.status == "created":
             security_created += 1
@@ -276,15 +310,17 @@ def prepare_account_pdfs(
 
         except PDFRedactionError as exc:
             redaction_failed += 1
-            redaction_failure_messages.add(str(exc))
+            row.update(redaction_status='failed', redaction_reason=error_reason(exc))
+            redaction_failure_messages.add(f"{relative} | {row['redaction_reason']}")
             continue
 
-        except Exception:
+        except Exception as exc:
             redaction_failed += 1
-            redaction_failure_messages.add(
-                "An unexpected redaction error occurred."
-            )
+            row.update(redaction_status='failed', redaction_reason=error_reason(exc))
+            redaction_failure_messages.add(f"{relative} | {row['redaction_reason']}")
             continue
+
+        row.update(redaction_status=redaction_result.status)
 
         if redaction_result.status == "created":
             redaction_created += 1
@@ -292,6 +328,30 @@ def prepare_account_pdfs(
             redaction_already_clean += 1
         elif redaction_result.status == "skipped":
             redaction_skipped += 1
+
+    report_path = None
+    report_error = None
+    temporary = None
+    try:
+        report_folder = _project_root(project_root) / 'preparation_reports' / folders.account_key
+        report_folder.mkdir(parents=True, exist_ok=True)
+        target = report_folder / (datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '_preparation.csv')
+        with NamedTemporaryFile(mode='w', encoding='utf-8-sig', newline='',
+                                dir=report_folder, delete=False, suffix='.tmp') as stream:
+            temporary = Path(stream.name)
+            writer = csv.DictWriter(stream, fieldnames=[
+                'source_pdf', 'security_status', 'security_reason',
+                'redaction_status', 'redaction_reason',
+            ])
+            writer.writeheader()
+            writer.writerows(report_rows)
+        temporary.replace(target)
+        report_path = target
+    except OSError as exc:
+        report_error = error_reason(exc)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
     return PDFPreparationResult(
         account_key=folders.account_key.as_posix(),
@@ -313,6 +373,9 @@ def prepare_account_pdfs(
         security_skipped_count=security_skipped,
         security_password_required_count=security_password_required,
         security_failed_count=security_failed,
+        security_failure_messages=tuple(security_failure_messages),
+        report_path=report_path,
+        report_error=report_error,
         redaction_created_count=redaction_created,
         redaction_already_clean_count=redaction_already_clean,
         redaction_skipped_count=redaction_skipped,

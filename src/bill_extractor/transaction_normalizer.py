@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from calendar import monthrange
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -341,14 +342,13 @@ def _resolve_row_dates(
         # Certain Simplii month-end statements include an
         # interest or month-end entry dated up to three days
         # after the printed period end. Accept this only when
-        # both transaction and effective dates independently
-        # resolve within that narrow grace period.
+        # both dates resolve within that narrow grace period, or a
+        # single-date legacy entry falls on that month's final day.
         if (
             metadata.profile_id
             in _SIMPLII_POST_PERIOD_PROFILES
             and metadata.statement_end_date
             is not None
-            and secondary_values
         ):
             try:
                 recovered_transaction = (
@@ -370,6 +370,16 @@ def _resolve_row_dates(
                 ).days
                 <= 3
             ):
+                if (
+                    not secondary_values
+                    and mapping.get("effective_date") == "Eff. date"
+                    and _is_blank(source_row["Eff. date"])
+                    and recovered_transaction.month == metadata.statement_end_date.month
+                    and recovered_transaction.day == monthrange(
+                        recovered_transaction.year, recovered_transaction.month
+                    )[1]
+                ):
+                    return recovered_transaction.isoformat(), {}
                 resolved_secondary_dates: dict[
                     str,
                     str,

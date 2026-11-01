@@ -61,3 +61,7 @@ config/profiles/*.local.json
 .idea/
 Thumbs.db
 desktop.ini
+
+# Generated preparation reports and cross-profile analysis
+/preparation_reports/
+/analysis_output/

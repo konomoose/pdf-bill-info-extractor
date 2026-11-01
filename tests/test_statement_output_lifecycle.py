@@ -279,7 +279,7 @@ class StatementOutputLifecycleTest(
                 / "2025"
                 / (
                     "test_bank_2025_"
-                    "transactions.csv"
+                    "normalized_transactions.csv"
                 ),
                 dtype=str,
                 keep_default_na=False,

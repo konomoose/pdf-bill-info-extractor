@@ -616,7 +616,7 @@ class PDFPreparationTest(unittest.TestCase):
             self.assertEqual(second.redaction_failed_count, 1)
             self.assertEqual(
                 second.redaction_failure_messages,
-                (REPLACE_REDACTED_PDF_ERROR,),
+                (f"statement.pdf | {REPLACE_REDACTED_PDF_ERROR}",),
             )
             self.assertEqual(file_hash(editable), editable_hash)
             self.assertEqual(file_hash(redacted), prior_redacted_hash)
