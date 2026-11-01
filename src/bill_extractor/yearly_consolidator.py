@@ -126,6 +126,12 @@ def _prepare_normalized_frame(
         starting_sequence,
         starting_sequence + len(prepared),
     )
+    # Matching values can represent separate transactions in one statement.
+    # Number each occurrence before combining frames so repeated input copies
+    # can be removed without collapsing those legitimate repeated entries.
+    prepared["_row_occurrence"] = prepared.groupby(
+        list(EXACT_DUPLICATE_COLUMNS), sort=False, dropna=False,
+    ).cumcount()
 
     return prepared
 
@@ -137,9 +143,10 @@ def consolidate_normalized_transactions(
     Consolidate normalized transactions into calendar-year tables.
 
     Transactions are assigned according to transaction_date, not the
-    statement folder or statement end date. Only exact duplicates across
-    all normalized columns are removed. The source_file column therefore
-    protects legitimate matching transactions from different statements.
+    statement folder or statement end date. Repeated entries within each
+    input statement remain separate. Across repeated input copies, only the
+    same occurrence of an exact normalized row is removed. source_file keeps
+    matching transactions from different statements separate.
     """
 
     prepared_frames: list[pd.DataFrame] = []
@@ -169,7 +176,7 @@ def consolidate_normalized_transactions(
     )
 
     combined = combined.drop_duplicates(
-        subset=list(EXACT_DUPLICATE_COLUMNS),
+        subset=[*EXACT_DUPLICATE_COLUMNS, "_row_occurrence"],
         keep="first",
     )
 
@@ -534,7 +541,8 @@ def write_paired_yearly_transaction_csvs(
 
     Raw values are copied verbatim. Resolved normalized dates determine the
     year and ordering, including statements spanning December and January.
-    Both formats share the existing exact-duplicate rule and commit together.
+    Both formats preserve repeated entries within a statement, remove repeated
+    input copies by row occurrence, and commit together.
     """
     targets, staged, stale_paths = stage_paired_yearly_transaction_csvs(
         frames, raw_frames, output_root=output_root,
@@ -601,7 +609,7 @@ def stage_paired_yearly_transaction_csvs(
             combined = pd.concat(prepared, ignore_index=True)
             raw_combined = pd.concat(originals, ignore_index=True)
             combined = combined.drop_duplicates(
-                subset=list(EXACT_DUPLICATE_COLUMNS), keep="first"
+                subset=[*EXACT_DUPLICATE_COLUMNS, "_row_occurrence"], keep="first"
             ).sort_values(
                 ["_transaction_sort", "_posting_sort", "_effective_sort",
                  "source_file", "_sequence"],
